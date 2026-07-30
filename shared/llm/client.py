@@ -1,0 +1,83 @@
+"""LLM 统一调用客户端"""
+
+import json
+import httpx
+
+from shared.utils import config
+
+DEEPSEEK_BASE = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-chat"  # V3, 性价比最高
+REASONING_MODEL = "deepseek-reasoner"  # R1, 复杂推理时使用
+
+
+class LLMClient:
+    """DeepSeek API 客户端"""
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str = DEEPSEEK_BASE,
+        default_model: str = DEFAULT_MODEL,
+    ):
+        self.api_key = api_key or config.DEEPSEEK_API_KEY
+        if not self.api_key:
+            raise ValueError(
+                "DEEPSEEK_API_KEY 未设置。请在 .env 文件中配置。\n"
+                "获取: https://platform.deepseek.com → API Keys"
+            )
+        self.base_url = base_url.rstrip("/")
+        self.default_model = default_model
+
+    def chat(
+        self,
+        messages: list[dict],
+        model: str | None = None,
+        temperature: float = 0.1,
+        json_mode: bool = False,
+        max_tokens: int = 2000,
+    ) -> str:
+        """发送对话请求，返回模型回复文本"""
+        payload = {
+            "model": model or self.default_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        r = httpx.post(
+            f"{self.base_url}/chat/completions",
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=60,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+    def extract_json(
+        self,
+        system_prompt: str,
+        user_input: str,
+        model: str | None = None,
+        temperature: float = 0.1,
+    ) -> dict:
+        """发送请求并解析 JSON 返回"""
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input},
+        ]
+        response = self.chat(messages, model=model,
+                            temperature=temperature, json_mode=True)
+        return json.loads(response)
+
+    def health_check(self) -> bool:
+        try:
+            self.chat([{"role": "user", "content": "Hi"}], max_tokens=10)
+            return True
+        except Exception:
+            return False
