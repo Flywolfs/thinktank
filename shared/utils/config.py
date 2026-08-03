@@ -32,6 +32,12 @@ SERPER_API_KEY = get("SERPER_API_KEY")
 SERPAPI_API_KEY = get("SERPAPI_API_KEY")
 BING_API_KEY = get("BING_API_KEY")
 
+# ── 社交媒体 Cookie（MediaCrawler）─────────────────────
+
+ZHIHU_COOKIE = get("ZHIHU_COOKIE")
+XHS_COOKIE = get("XHS_COOKIE")
+WEIBO_COOKIE = get("WEIBO_COOKIE")
+
 # ── LLM ────────────────────────────────────────────────
 
 DEEPSEEK_API_KEY = get("DEEPSEEK_API_KEY")

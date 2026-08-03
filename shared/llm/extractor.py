@@ -98,7 +98,7 @@ class EntityExtractor:
         user_input = f"核心实体: {entity_name}\n\n文本:\n{text[:4000]}"
 
         try:
-            data = self.llm.extract_json(EXTRACT_PROMPT, user_input)
+            data = self.llm.extract_json(EXTRACT_PROMPT, user_input, max_tokens=4000)
         except (json.JSONDecodeError, Exception) as e:
             return ExtractionResult(raw_json={"error": str(e)})
 

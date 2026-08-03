@@ -66,6 +66,25 @@ class EntitySearcher:
         except Exception:
             pass
 
+        # 知乎 / 小红书 / 微博（MediaCrawler）
+        try:
+            from shared.crawlers.media_crawler import (
+                ZhihuSearchProvider, XHSSearchProvider, WeiboSearchProvider,
+            )
+            for name, cls in (
+                ("zhihu", ZhihuSearchProvider),
+                ("xiaohongshu", XHSSearchProvider),
+                ("weibo", WeiboSearchProvider),
+            ):
+                try:
+                    p = cls()
+                    if p.health_check():
+                        self.providers[name] = p
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
         return self.providers
 
     def search(

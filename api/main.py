@@ -39,18 +39,24 @@ class InvestigateRequest(BaseModel):
     entity_name: str
     hints: str = ""
     goal: str = ""
+    max_rounds: int = 30
 
 
 # ── 调查流程 API ──────────────────────────────────────
 
 @app.post("/api/investigate")
 def investigate(req: InvestigateRequest):
-    """启动一次实体调查，返回 job_id"""
+    """启动一次实体调查（多轮深挖），返回 job_id"""
     if not req.entity_name.strip():
         raise HTTPException(400, "entity_name 不能为空")
 
-    # 启动后台调查（同步返回 job，调查在请求内执行）
-    job = _mgr.start(req.entity_name.strip(), hints=req.hints.strip(), goal=req.goal.strip())
+    rounds = max(1, req.max_rounds)  # 由用户设定，不硬限制上限
+    job = _mgr.start(
+        req.entity_name.strip(),
+        hints=req.hints.strip(),
+        goal=req.goal.strip(),
+        max_rounds=rounds,
+    )
     return {"job_id": job.id, "status": job.status}
 
 

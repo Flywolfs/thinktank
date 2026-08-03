@@ -133,7 +133,9 @@ class Synthesizer:
             )
 
         try:
-            data = self.llm.extract_json(system_context, user_input, temperature=0.2)
+            data = self.llm.extract_json(
+                system_context, user_input, temperature=0.2, max_tokens=8000
+            )
         except Exception as e:
             # LLM 失败：返回最小报告
             return AnalysisReport(
@@ -213,10 +215,16 @@ class Synthesizer:
     @staticmethod
     def _format_search_results(report: EntityReport) -> str:
         lines = []
-        for i, r in enumerate(report.web_results[:10]):
-            lines.append(f"[网页{i}] {r.title}\n  {r.url}\n  {(r.content or '')[:150]}")
-        for i, r in enumerate(report.social_results[:10]):
-            lines.append(f"[社交{i}] {r.title} (by {r.author})\n  {r.url}\n  {(r.content or '')[:100]}")
+        for i, r in enumerate(report.web_results[:15]):
+            lines.append(f"[网页{i}] {r.title}\n  {r.url}\n  {(r.content or '')[:200]}")
+        for i, r in enumerate(report.social_results[:15]):
+            lines.append(f"[社交{i}] {r.title} (by {r.author})\n  {r.url}")
+            # ASR 全文优先（B站视频口播内容，情报价值最高）
+            asr_text = r.metadata.get("asr_text") if isinstance(r.metadata, dict) else None
+            if asr_text:
+                lines.append(f"  [视频口播全文] {asr_text[:2000]}")
+            else:
+                lines.append(f"  {(r.content or '')[:200]}")
         for i, r in enumerate(report.knowledge_results[:3]):
             lines.append(f"[知识{i}] {r.title}\n  {(r.content or '')[:300]}")
         return "\n\n".join(lines) or "（无搜索结果）"

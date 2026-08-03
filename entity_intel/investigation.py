@@ -33,6 +33,8 @@ class InvestigationJob:
     report_markdown: str = ""                           # AnalysisReport.to_markdown()
     graph_built: bool = False
     thread_id: str = ""                 # LangGraph checkpoint thread_id（resume 用）
+    investigation_rounds: list[dict] = field(default_factory=list)  # 多轮深挖记录
+    leads: list[dict] = field(default_factory=list)                 # 线索队列
 
     def add_progress(self, phase: str, detail: str = ""):
         self.progress.append({"phase": phase, "detail": detail, "ts": time.time()})
@@ -53,6 +55,8 @@ class InvestigationJob:
             "report_markdown": self.report_markdown,
             "graph_built": self.graph_built,
             "thread_id": self.thread_id,
+            "investigation_rounds": self.investigation_rounds,
+            "leads": self.leads,
         }
 
 
@@ -106,25 +110,31 @@ class InvestigationManager:
 
     # ── 用户操作 ───────────────────────────────────────
 
-    def start(self, entity_name: str, hints: str = "", goal: str = "") -> InvestigationJob:
-        """启动一次调查，执行到 review 暂停点"""
+    def start(
+        self, entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30
+    ) -> InvestigationJob:
+        """启动一次调查（多轮深挖），执行到 review 暂停点"""
         job = InvestigationJob(
             entity_name=entity_name,
             hints=hints,
             goal=goal,
             status="running",
         )
-        job.add_progress("start", f"开始调查实体: {entity_name}")
+        job.add_progress("start", f"开始调查实体: {entity_name} (最多 {max_rounds} 轮深挖)")
         self.store.save(job)
 
         try:
             from entity_intel.graph import run_investigation
 
-            result, thread_id = run_investigation(entity_name, hints=hints, goal=goal)
+            result, thread_id = run_investigation(
+                entity_name, hints=hints, goal=goal, max_rounds=max_rounds
+            )
 
             # 从图状态同步结果
             job.thread_id = thread_id  # 保存 resume 用的 thread_id
             job.progress = result.get("progress", job.progress)
+            job.investigation_rounds = result.get("all_rounds", [])
+            job.leads = result.get("leads", [])
             analysis: AnalysisReport = result.get("analysis")
             if analysis and analysis.entity_summary:
                 job.report = analysis.to_dict()

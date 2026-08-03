@@ -25,6 +25,10 @@
               <el-form-item label="调查意图 (可选)">
                 <el-input v-model="form.goal" placeholder="如：调查人物商业版图" />
               </el-form-item>
+              <el-form-item label="深挖轮数 (max_rounds)">
+                <el-slider v-model="form.max_rounds" :min="1" :max="30" show-stops
+                           style="width: 100%" />
+              </el-form-item>
               <el-button type="primary" :loading="investigating" @click="startInvestigation">
                 开始调查
               </el-button>
@@ -47,6 +51,25 @@
                 <span v-if="p.detail"> — {{ p.detail }}</span>
               </el-timeline-item>
             </el-timeline>
+
+            <!-- 多轮深挖记录 -->
+            <template v-if="currentJob.investigation_rounds && currentJob.investigation_rounds.length">
+              <el-divider>🔍 多轮深挖轨迹</el-divider>
+              <el-timeline>
+                <el-timeline-item v-for="(r, i) in currentJob.investigation_rounds" :key="i"
+                                  :type="r.decide_continue ? 'warning' : 'success'"
+                                  :timestamp="'第 ' + r.round + ' 轮'">
+                  <b>搜索: {{ r.query }}</b>
+                  <div>新增线索 {{ r.new_leads }} 条 / 队列共 {{ r.total_leads }} 条</div>
+                  <div v-if="r.next_query" style="color: #e6a23c">
+                    下一轮追: {{ r.next_query }}
+                  </div>
+                  <div v-if="!r.decide_continue" style="color: #67c23a">
+                    ✓ 线索收敛，生成最终报告
+                  </div>
+                </el-timeline-item>
+              </el-timeline>
+            </template>
 
             <!-- HITL 操作 -->
             <template v-if="currentJob.status === 'review'">
@@ -110,7 +133,7 @@ import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 
 // ── 状态 ──────────────────────────────────────────────
-const form = ref({ entity_name: '', hints: '', goal: '' })
+const form = ref({ entity_name: '', hints: '', goal: '', max_rounds: 30 })
 const investigating = ref(false)
 const currentJob = ref(null)
 const jobs = ref([])
@@ -134,6 +157,7 @@ async function startInvestigation() {
       entity_name: form.value.entity_name.trim(),
       hints: form.value.hints.trim(),
       goal: form.value.goal.trim(),
+      max_rounds: form.value.max_rounds,
     })
     await loadJob(data.job_id)
     // 轮询进度（调查是同步执行的，这里主要等 review 状态）

@@ -65,6 +65,7 @@ class LLMClient:
         user_input: str,
         model: str | None = None,
         temperature: float = 0.1,
+        max_tokens: int = 2000,
     ) -> dict:
         """发送请求并解析 JSON 返回"""
         messages = [
@@ -72,7 +73,8 @@ class LLMClient:
             {"role": "user", "content": user_input},
         ]
         response = self.chat(messages, model=model,
-                            temperature=temperature, json_mode=True)
+                            temperature=temperature, json_mode=True,
+                            max_tokens=max_tokens)
         return json.loads(response)
 
     def health_check(self) -> bool:
