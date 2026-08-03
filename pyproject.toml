@@ -9,6 +9,10 @@ dependencies = [
     "python-dotenv",
     "pydantic",
     "neo4j>=6.2.0",
+    "langgraph>=1.2.10",
+    "langchain-core>=1.5.3",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.1",
 ]
 
 [build-system]

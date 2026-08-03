@@ -151,6 +151,64 @@ class EntitySearcher:
             report.errors["llm_extract"] = f"抽取失败: {e}"
             return None
 
+    def filter_results(
+        self, report: EntityReport, hints: str = "", goal: str = "", use_llm: bool = True
+    ) -> EntityReport:
+        """对搜索结果执行相关性筛选（复用通用 shared/nlp/relevance），原地更新 report"""
+        try:
+            from entity_intel.relevance import filter_entity_report
+            return filter_entity_report(report, hints=hints, goal=goal, use_llm=use_llm)
+        except Exception as e:
+            report.errors["relevance_filter"] = f"筛选失败: {e}"
+            return report
+
+    def synthesize(
+        self,
+        report: EntityReport,
+        hints: str = "",
+        goal: str = "",
+    ):
+        """
+        信息整合推理：把筛选后的元数据 + 抽取的实体整合为完整逻辑链路和报告。
+
+        这是进入知识图谱之前的最后一步——报告先给用户审阅（HITL），
+        用户决定是否构建知识图谱。
+        """
+        try:
+            from entity_intel.synthesizer import Synthesizer
+            from shared.models.analysis_report import AnalysisReport
+            return Synthesizer().synthesize(report, hints=hints, goal=goal)
+        except Exception as e:
+            from shared.models.analysis_report import AnalysisReport
+            report.errors["synthesize"] = f"报告生成失败: {e}"
+            return AnalysisReport(entity_name=report.entity_name)
+
+    def full_pipeline(
+        self,
+        entity_name: str,
+        hints: str = "",
+        goal: str = "",
+        max_per_source: int = 10,
+        use_llm_filter: bool = True,
+    ) -> dict:
+        """
+        完整流水线: 搜索 → 筛选 → 实体抽取 → 信息整合推理 → 报告
+
+        返回 dict:
+        {
+            "report": EntityReport,      # 搜索+筛选+抽取结果
+            "analysis": AnalysisReport,  # 整合推理报告（给用户审阅）
+        }
+        用户审阅 analysis 后，决定是否构建知识图谱。
+        """
+        report = self.search(
+            entity_name, max_per_source=max_per_source
+        )
+        self.filter_results(report, hints=hints, goal=goal, use_llm=use_llm_filter)
+        self.extract_entities(report)
+        analysis = self.synthesize(report, hints=hints, goal=goal)
+        return {"report": report, "analysis": analysis}
+
     @staticmethod
     def _safe_search(name: str, provider: BaseProvider, params: SearchParams) -> list[SearchResult]:
         """执行搜索，出错时向上抛（由调用方捕获并记录到 errors）"""

@@ -21,6 +21,7 @@ class EntityReport:
     knowledge_results: list[SearchResult] = field(default_factory=list)
     social_results: list[SearchResult] = field(default_factory=list)
     errors: dict[str, str] = field(default_factory=dict)  # source → error_msg
+    metadata: dict = field(default_factory=dict)          # 筛选/分析统计信息
 
     # LLM 抽取后的结构化数据（Phase 1 填充）
     core_summary: str = ""                # 实体概述

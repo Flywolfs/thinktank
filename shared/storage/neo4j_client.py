@@ -155,22 +155,23 @@ class Neo4jClient:
 
     def get_subgraph(self, name: str, depth: int = 1) -> list[dict]:
         """获取以某实体为中心的子图（N 跳范围内）"""
+        # 变量长度路径不能参数化，用安全整数拼接（depth 来自 API 参数，限制范围）
+        depth = max(1, min(int(depth), 5))
         with self.driver.session() as session:
             result = session.run(
-                """
-                MATCH path = (e:Entity {name: $name})-[*1..$depth]-(related)
+                f"""
+                MATCH path = (e:Entity {{name: $name}})-[*1..{depth}]-(related)
                 UNWIND relationships(path) AS r
                 UNWIND nodes(path) AS n
                 RETURN DISTINCT
                     n.name AS name,
                     n.type AS type,
                     n.summary AS summary,
-                    collect(DISTINCT {type: type(r), rel: r.relation, other: 
+                    collect(DISTINCT {{type: type(r), rel: r.relation, other: 
                         CASE WHEN startNode(r).name = n.name THEN endNode(r).name ELSE startNode(r).name END
-                    }) AS relations
+                    }}) AS relations
                 """,
                 name=name,
-                depth=depth,
             )
             entities = {}
             for record in result:

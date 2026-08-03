@@ -8,4 +8,19 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Secrets / config
 .env
+config.yaml
+
+# Runtime data
+data/
+
+# Node
+node_modules/
+web/node_modules/
+web/dist/
+
+# Audio assets (large, regenerate via bili audio)
+knowledge/raw/osint_methodology/audio/
+knowledge/raw/osint_methodology/*_merged/
