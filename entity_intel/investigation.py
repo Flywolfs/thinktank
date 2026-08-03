@@ -1,14 +1,9 @@
-"""调查任务管理 — HITL 状态机
+"""调查任务管理 — HITL 状态机（基于 LangGraph）
 
-流程: 启动调查 → running → review(等用户审阅) → approved(建图谱) / rejected(丢弃)
+使用 LangGraph 图执行调查（entity_intel/graph.py），
+review 节点 interrupt() 暂停等用户审阅，Command(resume) 恢复。
 
-状态:
-    pending   - 已创建，等待执行
-    running   - 调查执行中
-    review    - 报告已生成，等待用户审阅（HITL 关键点）
-    approved  - 用户批准，构建知识图谱
-    rejected  - 用户拒绝/丢弃
-    error     - 执行失败
+状态: pending → running → review(等用户审阅) → approved(建图谱) / rejected(丢弃)
 """
 
 import json
@@ -18,7 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from shared.models.analysis_report import AnalysisReport
-from shared.models.entity_report import EntityReport
 
 STORAGE_DIR = Path(__file__).parent.parent / "data" / "investigations"
 
@@ -38,6 +32,7 @@ class InvestigationJob:
     report: dict = field(default_factory=dict)          # AnalysisReport.to_dict()
     report_markdown: str = ""                           # AnalysisReport.to_markdown()
     graph_built: bool = False
+    thread_id: str = ""                 # LangGraph checkpoint thread_id（resume 用）
 
     def add_progress(self, phase: str, detail: str = ""):
         self.progress.append({"phase": phase, "detail": detail, "ts": time.time()})
@@ -57,11 +52,12 @@ class InvestigationJob:
             "report": self.report,
             "report_markdown": self.report_markdown,
             "graph_built": self.graph_built,
+            "thread_id": self.thread_id,
         }
 
 
 class InvestigationStore:
-    """调查任务的持久化存储（JSON 文件，MVP 够用）"""
+    """调查任务的持久化存储（JSON 文件）"""
 
     def __init__(self, storage_dir: Path | None = None):
         self.dir = storage_dir or STORAGE_DIR
@@ -103,22 +99,15 @@ class InvestigationStore:
 
 
 class InvestigationManager:
-    """调查任务管理器 — 编排完整 HITL 流程"""
+    """调查任务管理器 — 基于 LangGraph 的 HITL 流程"""
 
     def __init__(self, store: InvestigationStore | None = None):
         self.store = store or InvestigationStore()
-        self._searcher = None  # 惰性导入，避免循环依赖
-
-    def _get_searcher(self):
-        if self._searcher is None:
-            from entity_intel.searcher import EntitySearcher
-            self._searcher = EntitySearcher()
-        return self._searcher
 
     # ── 用户操作 ───────────────────────────────────────
 
     def start(self, entity_name: str, hints: str = "", goal: str = "") -> InvestigationJob:
-        """启动一次调查"""
+        """启动一次调查，执行到 review 暂停点"""
         job = InvestigationJob(
             entity_name=entity_name,
             hints=hints,
@@ -129,27 +118,18 @@ class InvestigationManager:
         self.store.save(job)
 
         try:
-            searcher = self._get_searcher()
+            from entity_intel.graph import run_investigation
 
-            job.add_progress("search", "多源并行搜索 (Wikipedia/Google/B站/企业)")
-            report = searcher.search(entity_name, max_per_source=10)
-            job.add_progress("search_done", f"搜索完成: {report.total_results} 条")
+            result, thread_id = run_investigation(entity_name, hints=hints, goal=goal)
 
-            job.add_progress("filter", "相关性筛选（两阶段）")
-            searcher.filter_results(report, hints=hints, goal=goal)
-            job.add_progress("filter_done", f"筛选保留 {report.metadata.get('filtered', {}).get('final_kept', 0)} 条")
+            # 从图状态同步结果
+            job.thread_id = thread_id  # 保存 resume 用的 thread_id
+            job.progress = result.get("progress", job.progress)
+            analysis: AnalysisReport = result.get("analysis")
+            if analysis and analysis.entity_summary:
+                job.report = analysis.to_dict()
+                job.report_markdown = analysis.to_markdown()
 
-            job.add_progress("extract", "LLM 实体抽取")
-            searcher.extract_entities(report)
-            job.add_progress("extract_done", f"抽取 {len(report.related_entities)} 个相关实体")
-
-            job.add_progress("synthesize", "信息整合推理，生成逻辑链路报告")
-            analysis = searcher.synthesize(report, hints=hints, goal=goal)
-            job.report = analysis.to_dict()
-            job.report_markdown = analysis.to_markdown()
-            job.add_progress("synthesize_done", f"报告生成: {len(analysis.logical_chains)} 条逻辑链路")
-
-            # HITL 关键点：进入 review 状态，等用户审阅
             job.status = "review"
             job.add_progress("review", "报告已生成，等待用户审阅决定是否构建知识图谱")
 
@@ -162,7 +142,7 @@ class InvestigationManager:
         return job
 
     def approve(self, job_id: str) -> InvestigationJob:
-        """用户批准，构建知识图谱"""
+        """用户批准，通过 Command(resume) 恢复图执行并构建图谱"""
         job = self._require(job_id)
         if job.status != "review":
             job.error = f"当前状态 {job.status} 不可批准（需 review）"
@@ -170,42 +150,15 @@ class InvestigationManager:
             return job
 
         try:
-            job.add_progress("graph", "构建知识图谱 (Neo4j)")
-            from shared.storage.neo4j_client import Neo4jClient
+            from entity_intel.graph import resume_investigation
 
-            client = Neo4jClient()
-            client.ensure_indexes()
-
-            # 1. 核心实体节点
-            client.merge_entity(
-                job.entity_name,
-                entity_type="person",
-                summary=job.report.get("entity_summary", "")[:500],
-                source="investigation",
-            )
-
-            # 2. 建议实体节点
-            for e in job.report.get("suggested_entities", []):
-                client.merge_entity(
-                    e.get("name", ""),
-                    entity_type=e.get("type", ""),
-                    source="investigation",
-                )
-
-            # 3. 建议关系（from → to）
-            rel_count = 0
-            for r in job.report.get("suggested_relations", []):
-                frm, to, rel = r.get("from", ""), r.get("to", ""), r.get("relation", "")
-                if frm and to and rel:
-                    client.merge_relation(frm, to, rel, source="investigation")
-                    rel_count += 1
-
+            result = resume_investigation(job.thread_id, action="approve")
+            job.progress = result.get("progress", job.progress)
             job.graph_built = True
             job.status = "approved"
-            job.add_progress(
-                "graph_done",
-                f"图谱构建完成: {len(job.report.get('suggested_entities', []))} 实体, {rel_count} 关系",
-            )
+            # 最后一步进度应该是 graph_done
+            if job.progress and job.progress[-1]["phase"] == "graph_done":
+                job.add_progress("approved", "调查完成")
 
         except Exception as e:
             job.status = "error"
@@ -216,8 +169,13 @@ class InvestigationManager:
         return job
 
     def reject(self, job_id: str) -> InvestigationJob:
-        """用户拒绝/丢弃报告"""
+        """用户拒绝/丢弃"""
         job = self._require(job_id)
+        try:
+            from entity_intel.graph import resume_investigation
+            resume_investigation(job.thread_id, action="reject")
+        except Exception:
+            pass  # reject 失败不阻塞状态更新
         job.status = "rejected"
         job.add_progress("reject", "用户丢弃本次调查")
         self.store.save(job)
@@ -240,15 +198,10 @@ class InvestigationManager:
 
 # ==================== 自检 ====================
 if __name__ == "__main__":
-    import sys
-
-    print("InvestigationManager 自检")
+    print("InvestigationManager (LangGraph) 自检")
     print("=" * 40)
 
     mgr = InvestigationManager()
-
-    # 用一个小实体快速验证（不走完整调查，只验证状态机）
-    test_id = "test123"
     job = mgr.start("雷军", hints="小米汽车")
     print(f"任务: {job.id} | 状态: {job.status}")
     print(f"进度: {len(job.progress)} 步")
@@ -257,10 +210,9 @@ if __name__ == "__main__":
 
     if job.status == "review":
         print(f"\n✅ HITL: 报告已生成，等用户审阅")
-        print(f"报告含: {len(job.report.get('logical_chains', []))} 条链路")
-
-        # 模拟用户批准
         job2 = mgr.approve(job.id)
-        print(f"\n批准后状态: {job2.status} | 图谱构建: {job2.graph_built}")
-    elif job.status == "error":
-        print(f"\n❌ 调查失败: {job.error}")
+        print(f"批准后: {job2.status} | 图谱构建: {job2.graph_built}")
+        if job2.error:
+            print(f"❌ {job2.error}")
+        else:
+            print(f"最后进度: {job2.progress[-1]['detail']}")
