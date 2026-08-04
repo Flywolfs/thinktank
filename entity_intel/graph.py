@@ -42,9 +42,13 @@ class InvestigationState(TypedDict):
     goal: str
     max_rounds: int
 
+    # Plan-and-Execute 状态
+    plan: list[dict]                # 维度模板 [{name, methodology_source, rationale, queries, priority}]
+    plan_index: int                 # 当前执行到第几个维度（0-based）
+
     # 多轮深挖状态
     round: int                      # 当前轮次（从 1 开始）
-    search_plan: list[str]          # 本轮搜索计划（多个搜索角度）
+    search_plan: list[str]          # 本轮搜索计划（当前维度的多个搜索角度）
     visited: list[str]              # 已搜索过的关键词（防环路）
     leads: list[dict]               # 线索队列（Lead.to_dict()）
     all_rounds: list[dict]          # 每轮结果摘要
@@ -64,6 +68,108 @@ def _add_progress(state: InvestigationState, phase: str, detail: str = "") -> li
     return state.get("progress", []) + [
         {"phase": phase, "detail": detail, "ts": time.time()}
     ]
+
+
+def _load_methodology_snippet() -> str:
+    """加载方法论文档的 Plan 章节作为 plan_node 的 system 上下文"""
+    from pathlib import Path
+    p = Path(__file__).parent / "INVESTIGATION_METHODOLOGY.md"
+    try:
+        text = p.read_text(encoding="utf-8")
+        # 提取"调查计划制定"章节
+        if "## 调查计划制定" in text:
+            start = text.index("## 调查计划制定")
+            end = text.index("## 调查流程", start) if "## 调查流程" in text[start:] else len(text)
+            return text[start:end]
+        return text[:6000]
+    except Exception:
+        return ""
+
+
+def plan_node(state: InvestigationState) -> dict:
+    """Plan 阶段：LLM 读方法论，根据实体+hints+goal 动态制定维度模板"""
+    llm = LLMClient()
+    methodology = _load_methodology_snippet()
+
+    prompt = f"""
+调查核心实体: {state["entity_name"]}
+用户关注方向: {state.get("hints", "") or "（无）"}
+调查意图: {state.get("goal", "") or "全面调查"}
+最大轮数上限: {state.get("max_rounds", 30)}
+
+【调查计划制定方法论】
+{methodology[:8000]}
+
+请为本次调查制定【维度模板】。输出 JSON:
+{{
+  "dimensions": [
+    {{
+      "name": "维度名",
+      "methodology_source": "引用的方法论来源（如：核心方法论§1 穷尽明面信息）",
+      "rationale": "为什么选这个维度（结合实体特征）",
+      "queries": ["搜索角度1", "搜索角度2", "搜索角度3"],
+      "priority": "high|medium|low"
+    }}
+  ],
+  "max_rounds": 6,
+  "plan_summary": "一句话概述调查路径"
+}}
+
+严格遵守方法论中的【制定规则】:
+1. 每个维度必须能在方法论映射表中找到来源，不得凭空发明
+2. 基线档案永远第一
+3. 3-7 个维度，每个维度 2-4 个搜索角度
+4. 根据实体类型选默认维度集，再按 hints 调整优先级
+5. 维度之间覆盖不同信息层面，避免重叠
+6. max_rounds 不超过 {state.get("max_rounds", 30)}
+"""
+    try:
+        data = llm.extract_json(prompt, "请制定调查计划", temperature=0.3, max_tokens=4000)
+        dimensions = data.get("dimensions", [])
+        # 过滤：必须有 name 和 queries
+        dimensions = [d for d in dimensions if d.get("name") and d.get("queries")]
+        if not dimensions:
+            # 兜底：单维度基线档案
+            dimensions = [{
+                "name": "基线档案",
+                "methodology_source": "核心方法论§1 穷尽明面信息",
+                "rationale": "兜底计划：先建立实体基准",
+                "queries": [state["entity_name"]],
+                "priority": "high",
+            }]
+        max_rounds = int(data.get("max_rounds", 6))
+        max_rounds = max(1, min(max_rounds, state.get("max_rounds", 30)))
+    except Exception as e:
+        dimensions = [{
+            "name": "基线档案",
+            "methodology_source": "核心方法论§1 穷尽明面信息",
+            "rationale": f"LLM 计划失败，兜底: {str(e)[:50]}",
+            "queries": [state["entity_name"]],
+            "priority": "high",
+        }]
+        max_rounds = min(state.get("max_rounds", 30), 6)
+
+    summary = ""
+    data = None
+    try:
+        if 'data' in dir():
+            data = locals().get('data')
+    except Exception:
+        pass
+    if data and data.get("plan_summary"):
+        summary = data["plan_summary"]
+    return {
+        "plan": dimensions,
+        "plan_index": 0,
+        "max_rounds": max_rounds,
+        "search_plan": dimensions[0]["queries"],
+        "round": 1,
+        "progress": _add_progress(
+            state, "plan",
+            f"制定调查计划: {len(dimensions)} 维度 / {max_rounds} 轮\n"
+            f"{summary or '; '.join(d['name'] for d in dimensions)}",
+        ),
+    }
 
 
 def _merge_reports(target: EntityReport, new: EntityReport):
@@ -86,7 +192,10 @@ def _merge_reports(target: EntityReport, new: EntityReport):
 # ── 节点实现 ──────────────────────────────────────────
 
 def search_node(state: InvestigationState) -> dict:
-    """按搜索计划多角度并行搜索，结果累积到 report"""
+    """按搜索计划多角度搜索，结果累积到 report。
+    性能策略: 第1个 query 用全源（含 MediaCrawler），
+    其余 query 用快速源（跳过 MediaCrawler，避免重复爬取和输出目录冲突）。"""
+    import concurrent.futures
     from entity_intel.searcher import EntitySearcher
 
     searcher = EntitySearcher()
@@ -94,19 +203,47 @@ def search_node(state: InvestigationState) -> dict:
     report = state.get("report") or EntityReport(entity_name=state["entity_name"])
 
     visited = list(state.get("visited", []))
+    queries = [q.strip() for q in plan if q and q.strip()]
+
     details = []
-    for q in plan:
-        q = q.strip()
-        if not q:
-            continue
+
+    # 第1个 query：全源（含 MediaCrawler 知乎/小红书/微博）
+    if queries:
+        q0 = queries[0]
         try:
-            r = searcher.search(q, max_per_source=10)
+            r = searcher.search(q0, max_per_source=10)
             _merge_reports(report, r)
-            details.append(f"'{q}'+{r.total_results}")
-            if q not in visited:
-                visited.append(q)
+            details.append(f"'{q0}'+{r.total_results}")
+            if q0 not in visited:
+                visited.append(q0)
         except Exception as e:
-            details.append(f"'{q}'✗{str(e)[:40]}")
+            details.append(f"'{q0}'✗{str(e)[:40]}")
+
+    # 其余 query：快速源并行（无 MediaCrawler）
+    rest = queries[1:]
+    if rest:
+        def _fast_search(q: str) -> tuple[str, int, str]:
+            try:
+                r = searcher.search_fast(q, max_per_source=10)
+                return q, r.total_results, ""
+            except Exception as e:
+                return q, 0, str(e)[:40]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {ex.submit(_fast_search, q): q for q in rest}
+            for fut in concurrent.futures.as_completed(futures):
+                q, cnt, err = fut.result()
+                if err:
+                    details.append(f"'{q}'✗{err}")
+                else:
+                    try:
+                        r = searcher.search_fast(q, max_per_source=10)
+                        _merge_reports(report, r)
+                        details.append(f"'{q}'+{r.total_results}")
+                        if q not in visited:
+                            visited.append(q)
+                    except Exception as e:
+                        details.append(f"'{q}'✗{str(e)[:40]}")
 
     return {
         "report": report,
@@ -215,11 +352,14 @@ def deep_audio_node(state: InvestigationState) -> dict:
 
 
 def analyze_leads_node(state: InvestigationState) -> dict:
-    """核心：LLM 生成下一轮搜索计划（多角度），决定继续还是收敛"""
-    llm = LLMClient()
+    """执行控制：按维度模板轮转，判断是否进入下一维度/完成"""
     report = state["report"]
+    plan = state.get("plan", [])
+    plan_index = state.get("plan_index", 0)
+    round_num = state.get("round", 1)
+    max_rounds = state.get("max_rounds", 30)
 
-    # 维护线索队列：把抽取的实体加入（去重、防环路）
+    # 维护线索队列（记录发现，供报告使用）
     leads = [Lead(**l) for l in state.get("leads", [])]
     queue = LeadQueue()
     for l in leads:
@@ -236,118 +376,54 @@ def analyze_leads_node(state: InvestigationState) -> dict:
             relation=rel,
             priority="high" if rel in ("创始人", "CEO", "控制", "控股", "投资", "资助") else "medium",
             reason=f"实体抽取: {rel or '关联'}",
-            source_round=state.get("round", 1),
+            source_round=round_num,
         ))
 
-    round_num = state.get("round", 1)
-    max_rounds = state.get("max_rounds", 30)
+    # 当前维度
+    current_dim = plan[plan_index] if plan and plan_index < len(plan) else None
+    current_dim_name = current_dim.get("name", "未知维度") if current_dim else "未知维度"
 
-    # LLM 生成搜索计划
-    plan, should_continue, plan_reason = _generate_search_plan(llm, state, report, queue)
-
-    # 记录本轮
+    # 记录本轮结果
     all_rounds = list(state.get("all_rounds", []))
     all_rounds.append({
         "round": round_num,
-        "plan": plan,
+        "dimension": current_dim_name,
+        "queries": state.get("search_plan", []),
         "total_leads": len(queue.all()),
         "findings": [f.get("name", "") for f in report.related_entities[-10:]],
-        "decide_continue": should_continue,
-        "reason": plan_reason,
     })
 
-    can_continue = should_continue and bool(plan) and round_num < max_rounds
+    # 判断：是否所有维度执行完，或达到轮数上限
+    all_dims_done = (plan_index + 1) >= len(plan)
+    rounds_exhausted = round_num >= max_rounds
 
+    if all_dims_done or rounds_exhausted:
+        reason = "所有维度执行完毕" if all_dims_done else f"达到轮数上限({max_rounds})"
+        result: dict = {
+            "leads": queue.to_dict_list(),
+            "all_rounds": all_rounds,
+            "decision": "stop",
+            "progress": _add_progress(state, "analyze_leads", f"收敛({reason})"),
+        }
+        return result
+
+    # 进入下一维度
+    next_index = plan_index + 1
+    next_dim = plan[next_index]
     result: dict = {
         "leads": queue.to_dict_list(),
         "all_rounds": all_rounds,
+        "plan_index": next_index,
+        "search_plan": next_dim.get("queries", [state["entity_name"]]),
+        "round": round_num + 1,
+        "decision": "continue",
         "progress": _add_progress(
             state, "analyze_leads",
-            f"计划{len(plan)}角度: {'; '.join(plan[:3])}{'...' if len(plan)>3 else ''}"
-            if can_continue else f"收敛({plan_reason})",
+            f"维度完成 [{current_dim_name}] → 进入 [{next_dim.get('name', '')}] "
+            f"({next_index+1}/{len(plan)})",
         ),
     }
-
-    if can_continue:
-        result["search_plan"] = plan
-        result["round"] = round_num + 1
-        result["decision"] = "continue"
-    else:
-        result["decision"] = "stop"
-
     return result
-
-
-def _generate_search_plan(
-    llm: LLMClient, state: InvestigationState, report: EntityReport, queue: LeadQueue
-) -> tuple[list[str], bool, str]:
-    """LLM 生成下一轮搜索计划（3-5 个搜索角度），判断是否值得继续"""
-    try:
-        leads_desc = "\n".join(
-            f"- {l.name} ({l.relation}, {l.priority}) {'已追' if l.searched else '待追'}"
-            for l in queue.all()
-        ) or "（空）"
-        findings_desc = "\n".join(
-            f"- {e.get('name', '')} --{e.get('relation', '')}--> {report.entity_name}"
-            for e in report.related_entities[:15]
-        ) or "（无）"
-        visited_desc = ", ".join(state.get("visited", [])) or "（无）"
-        already = "\n".join(
-            f"- {f.title}" for f in report.web_results[-8:] + report.social_results[-8:]
-        )[:1200] or "（无）"
-
-        prompt = f"""
-调查核心实体: {state["entity_name"]}
-用户关注: {state.get("hints", "") or "（无）"}
-调查意图: {state.get("goal", "") or "全面调查"}
-当前轮次: {state.get("round", 1)} / {state.get("max_rounds", 30)}
-
-【已搜索过的关键词】
-{visited_desc}
-
-【本轮已发现的实体关系】
-{findings_desc}
-
-【线索队列（待追实体）】
-{leads_desc}
-
-【本轮已收集的部分结果】
-{already}
-
-请为【下一轮】生成搜索计划。输出 JSON:
-{{
-  "continue": true/false,
-  "plan": ["搜索词1", "搜索词2", "搜索词3"],
-  "reason": "为什么继续/停止"
-}}
-
-搜索计划生成规则（结合情报分析方法论）:
-- 生成 3-5 个【不同角度】的搜索词，不要全是"实体名+线索名"的简单拼接
-- 覆盖多个维度，例如:
-  * 历史回溯: "雷军 2010 创办小米" "雷军 早年 金山"
-  * 利益链条: "雷军 顺为资本 投资" "雷军 持股"
-  * 争议/风险: "雷军 争议" "小米 诉讼"
-  * 人物关系: "雷军 与 柳传志" "雷军 同学 校友"
-  * 时间线事件: "雷军 上市" "雷军 年度演讲"
-  * 用户关注方向(hints)优先
-- 每个搜索词必须是【尚未搜索过】的新角度（对比 visited），避免环路
-- 如果已多轮且信息增量明显下降，或线索/角度已穷尽 → continue=false
-- continue=true 时 plan 至少 3 个搜索词
-"""
-        data = llm.extract_json(prompt, "请生成搜索计划", temperature=0.3, max_tokens=2000)
-        plan = [p.strip() for p in data.get("plan", []) if p and p.strip()]
-        plan = [p for p in plan if p not in state.get("visited", [])][:5]
-
-        if data.get("continue") and plan:
-            return plan, True, data.get("reason", "")
-        return [], False, data.get("reason", "LLM 判定信息已收敛")
-    except Exception:
-        # LLM 失败：若有 high 线索，保守追一个
-        pending = queue.next()
-        if pending and pending.priority == "high":
-            q = f"{state['entity_name']} {pending.name}"
-            return [q], True, "LLM 决策失败，保守追 high 线索"
-        return [], False, "LLM 决策失败，停止"
 
 
 def synthesize_node(state: InvestigationState) -> dict:
@@ -458,6 +534,7 @@ def get_checkpointer():
 def get_graph():
     if "graph" not in _graph:
         builder = StateGraph(InvestigationState)
+        builder.add_node("plan", plan_node)
         builder.add_node("search", search_node)
         builder.add_node("filter", filter_node)
         builder.add_node("extract", extract_node)
@@ -467,7 +544,8 @@ def get_graph():
         builder.add_node("review", review_node)
         builder.add_node("graph_build", graph_build_node)
 
-        builder.add_edge(START, "search")
+        builder.add_edge(START, "plan")
+        builder.add_edge("plan", "search")
         builder.add_edge("search", "filter")
         builder.add_edge("filter", "extract")
         builder.add_edge("extract", "deep_audio")
@@ -501,6 +579,8 @@ def run_investigation(
         "hints": hints,
         "goal": goal,
         "max_rounds": max_rounds,
+        "plan": [],             # plan_node 填充
+        "plan_index": 0,
         "round": 1,
         "search_plan": [entity_name],
         "visited": [],

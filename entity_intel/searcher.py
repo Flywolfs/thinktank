@@ -157,6 +157,48 @@ class EntitySearcher:
 
         return report
 
+    def search_fast(
+        self,
+        entity_name: str,
+        max_per_source: int = 10,
+    ) -> EntityReport:
+        """快速搜索：跳过 MediaCrawler（zhihu/xhs/weibo 慢源）。
+        用于一轮中的后续 query——同一实体不同关键词，
+        MediaCrawler 结果高度重叠，重复爬取浪费且会互相干扰。"""
+        report = EntityReport(entity_name=entity_name, search_depth=1)
+        providers = self._get_providers()
+        if not providers:
+            return report
+
+        params = SearchParams(query=entity_name, max_results=max_per_source)
+        results: dict[str, list[SearchResult]] = {}
+        errors: dict[str, str] = {}
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_map = {
+                executor.submit(self._safe_search, name, provider, params): name
+                for name, provider in providers.items()
+                if name not in ("zhihu", "xiaohongshu", "weibo")
+            }
+            for future in concurrent.futures.as_completed(future_map):
+                name = future_map[future]
+                try:
+                    results[name] = future.result()
+                except Exception as e:
+                    errors[name] = str(e)
+
+        report.errors = errors
+        for source_name, items in results.items():
+            for item in items:
+                if item.source_type == "knowledge":
+                    report.knowledge_results.append(item)
+                elif item.source_type == "social":
+                    report.social_results.append(item)
+                else:
+                    report.web_results.append(item)
+        report.total_results = sum(len(v) for v in results.values())
+        return report
+
     def extract_entities(self, report: EntityReport) -> dict | None:
         """对搜索结果运行 LLM 实体抽取，填充 report.related_entities"""
         try:
