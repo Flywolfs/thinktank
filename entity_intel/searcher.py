@@ -8,6 +8,7 @@ from shared.crawlers.web_search import SerperProvider
 from shared.crawlers.bilibili import BilibiliCLIProvider
 from shared.crawlers.knowledge import WikipediaProvider
 from shared.models.entity_report import EntityReport
+from shared.utils.logger import archive_search_results
 
 
 class EntitySearcher:
@@ -152,6 +153,12 @@ class EntitySearcher:
 
         report.total_results = sum(len(v) for v in results.values())
 
+        # 统一存档：所有源结果落盘 data/raw/search/
+        all_results = (
+            report.web_results + report.social_results + report.knowledge_results
+        )
+        archive_search_results(all_results, entity_name, source="search")
+
         # 提取百科摘要作为 core_summary
         self._extract_core_summary(report)
 
@@ -197,6 +204,12 @@ class EntitySearcher:
                 else:
                     report.web_results.append(item)
         report.total_results = sum(len(v) for v in results.values())
+
+        # 统一存档（快速搜索同样存档）
+        all_results = (
+            report.web_results + report.social_results + report.knowledge_results
+        )
+        archive_search_results(all_results, entity_name, source="search_fast")
         return report
 
     def extract_entities(self, report: EntityReport) -> dict | None:

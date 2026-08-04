@@ -35,6 +35,7 @@ class InvestigationJob:
     thread_id: str = ""                 # LangGraph checkpoint thread_id（resume 用）
     investigation_rounds: list[dict] = field(default_factory=list)  # 多轮深挖记录
     leads: list[dict] = field(default_factory=list)                 # 线索队列
+    plan: list[dict] = field(default_factory=list)                  # 维度模板
 
     def add_progress(self, phase: str, detail: str = ""):
         self.progress.append({"phase": phase, "detail": detail, "ts": time.time()})
@@ -57,6 +58,7 @@ class InvestigationJob:
             "thread_id": self.thread_id,
             "investigation_rounds": self.investigation_rounds,
             "leads": self.leads,
+            "plan": self.plan,
         }
 
 
@@ -127,7 +129,8 @@ class InvestigationManager:
             from entity_intel.graph import run_investigation
 
             result, thread_id = run_investigation(
-                entity_name, hints=hints, goal=goal, max_rounds=max_rounds
+                entity_name, hints=hints, goal=goal, max_rounds=max_rounds,
+                job_id=job.id,
             )
 
             # 从图状态同步结果
@@ -135,6 +138,7 @@ class InvestigationManager:
             job.progress = result.get("progress", job.progress)
             job.investigation_rounds = result.get("all_rounds", [])
             job.leads = result.get("leads", [])
+            job.plan = result.get("plan", [])
             analysis: AnalysisReport = result.get("analysis")
             if analysis and analysis.entity_summary:
                 job.report = analysis.to_dict()

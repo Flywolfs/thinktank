@@ -60,6 +60,7 @@ class InvestigationState(TypedDict):
     progress: list[dict]
     error: str
     decision: str                   # continue/stop/approve/reject
+    job_id: str                     # 日志用 job_id
 
 
 # ── 工具 ──────────────────────────────────────────────
@@ -68,6 +69,15 @@ def _add_progress(state: InvestigationState, phase: str, detail: str = "") -> li
     return state.get("progress", []) + [
         {"phase": phase, "detail": detail, "ts": time.time()}
     ]
+
+
+def _get_logger(state: InvestigationState):
+    """从 state 获取调查日志器"""
+    from shared.utils.logger import InvestigationLogger
+    return InvestigationLogger(
+        job_id=state.get("job_id", "unknown"),
+        thread_id="",
+    )
 
 
 def _load_methodology_snippet() -> str:
@@ -88,6 +98,9 @@ def _load_methodology_snippet() -> str:
 
 def plan_node(state: InvestigationState) -> dict:
     """Plan 阶段：LLM 读方法论，根据实体+hints+goal 动态制定维度模板"""
+    logger = _get_logger(state)
+    logger.node_start("plan", {"entity": state["entity_name"], "hints": state.get("hints", "")})
+    t0 = time.time()
     llm = LLMClient()
     methodology = _load_methodology_snippet()
 
@@ -158,6 +171,13 @@ def plan_node(state: InvestigationState) -> dict:
         pass
     if data and data.get("plan_summary"):
         summary = data["plan_summary"]
+    logger.decision(
+        "plan", "制定完成",
+        reason=f"{len(dimensions)} 维度 / {max_rounds} 轮",
+        detail={"dimensions": [d.get("name") for d in dimensions], "summary": summary},
+    )
+    logger.node_end("plan", {"dimensions": len(dimensions), "max_rounds": max_rounds},
+                    duration_ms=(time.time() - t0) * 1000)
     return {
         "plan": dimensions,
         "plan_index": 0,
@@ -198,12 +218,15 @@ def search_node(state: InvestigationState) -> dict:
     import concurrent.futures
     from entity_intel.searcher import EntitySearcher
 
+    logger = _get_logger(state)
+    t0 = time.time()
     searcher = EntitySearcher()
     plan = state.get("search_plan") or [state["entity_name"]]
     report = state.get("report") or EntityReport(entity_name=state["entity_name"])
 
     visited = list(state.get("visited", []))
     queries = [q.strip() for q in plan if q and q.strip()]
+    logger.node_start("search", {"queries": queries, "round": state.get("round", 1)})
 
     details = []
 
@@ -216,8 +239,10 @@ def search_node(state: InvestigationState) -> dict:
             details.append(f"'{q0}'+{r.total_results}")
             if q0 not in visited:
                 visited.append(q0)
+            logger.tool_call("search_full", {"query": q0}, result_summary=f"{r.total_results} 条")
         except Exception as e:
             details.append(f"'{q0}'✗{str(e)[:40]}")
+            logger.tool_call("search_full", {"query": q0}, error=str(e)[:200])
 
     # 其余 query：快速源并行（无 MediaCrawler）
     rest = queries[1:]
@@ -235,6 +260,7 @@ def search_node(state: InvestigationState) -> dict:
                 q, cnt, err = fut.result()
                 if err:
                     details.append(f"'{q}'✗{err}")
+                    logger.tool_call("search_fast", {"query": q}, error=err)
                 else:
                     try:
                         r = searcher.search_fast(q, max_per_source=10)
@@ -242,9 +268,13 @@ def search_node(state: InvestigationState) -> dict:
                         details.append(f"'{q}'+{r.total_results}")
                         if q not in visited:
                             visited.append(q)
+                        logger.tool_call("search_fast", {"query": q}, result_summary=f"{r.total_results} 条")
                     except Exception as e:
                         details.append(f"'{q}'✗{str(e)[:40]}")
+                        logger.tool_call("search_fast", {"query": q}, error=str(e)[:200])
 
+    logger.node_end("search", {"queries": len(queries), "results": len(details)},
+                    duration_ms=(time.time() - t0) * 1000)
     return {
         "report": report,
         "visited": visited,
@@ -353,6 +383,7 @@ def deep_audio_node(state: InvestigationState) -> dict:
 
 def analyze_leads_node(state: InvestigationState) -> dict:
     """执行控制：按维度模板轮转，判断是否进入下一维度/完成"""
+    logger = _get_logger(state)
     report = state["report"]
     plan = state.get("plan", [])
     plan_index = state.get("plan_index", 0)
@@ -399,6 +430,8 @@ def analyze_leads_node(state: InvestigationState) -> dict:
 
     if all_dims_done or rounds_exhausted:
         reason = "所有维度执行完毕" if all_dims_done else f"达到轮数上限({max_rounds})"
+        logger.decision("analyze_leads", "stop", reason=reason,
+                        detail={"plan_index": plan_index, "total_dimensions": len(plan)})
         result: dict = {
             "leads": queue.to_dict_list(),
             "all_rounds": all_rounds,
@@ -410,6 +443,11 @@ def analyze_leads_node(state: InvestigationState) -> dict:
     # 进入下一维度
     next_index = plan_index + 1
     next_dim = plan[next_index]
+    logger.decision(
+        "analyze_leads", "continue", reason="进入下一维度",
+        detail={"from": current_dim_name, "to": next_dim.get("name", ""),
+                "progress": f"{next_index+1}/{len(plan)}"},
+    )
     result: dict = {
         "leads": queue.to_dict_list(),
         "all_rounds": all_rounds,
@@ -430,10 +468,17 @@ def synthesize_node(state: InvestigationState) -> dict:
     """信息整合推理 → 最终分析报告（基于累积结果）"""
     from entity_intel.synthesizer import Synthesizer
 
+    logger = _get_logger(state)
+    t0 = time.time()
     report = state["report"]
     analysis = Synthesizer().synthesize(
         report, hints=state["hints"], goal=state["goal"]
     )
+    logger.node_end("synthesize",
+                    {"logical_chains": len(analysis.logical_chains),
+                     "findings": len(analysis.key_findings),
+                     "timeline": len(analysis.timeline)},
+                    duration_ms=(time.time() - t0) * 1000)
     return {
         "analysis": analysis,
         "progress": _add_progress(
@@ -568,7 +613,8 @@ def get_graph():
 # ── 对外接口 ──────────────────────────────────────────
 
 def run_investigation(
-    entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30
+    entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30,
+    job_id: str = "",
 ) -> tuple[dict, str]:
     """执行调查（多轮深挖）到 review 暂停点。返回 (result_state, thread_id)"""
     thread_id = f"inv_{int(time.time()*1000)}"
@@ -592,6 +638,7 @@ def run_investigation(
         "progress": [],
         "error": "",
         "decision": "",
+        "job_id": job_id or thread_id,
     }
 
     result = get_graph().invoke(initial, config)
