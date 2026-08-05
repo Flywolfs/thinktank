@@ -1,0 +1,44 @@
+# 情报 Planner Agent — 专用 Hermes Docker 部署（独立实例）
+#
+# 专职: ①情报 plan 决策（接收实体+hints → 返回维度模板 JSON）
+#       ②额外爬虫代码编写（为 Phase C 动态工具创建做准备）
+#
+# 特点:
+# - 完全独立的数据目录 ~/.hermes-intel-planner（不碰宿主机 ~/.hermes 和现有 profiles）
+# - 模型 key 通过环境变量注入（不复制 .env 文件）
+# - 只加载情报 skill + 核心工具，禁用无关工具（省 token）
+# - API server 暴露 8643 端口，think_tank 系统通过 OpenAI 兼容接口调用
+#
+# 使用:
+#   export DEEPSEEK_API_KEY=sk-xxx        # 先设置 key（或写在 .env 文件同目录）
+#   docker compose up -d                  # 启动
+#   ./setup.sh                            # 首次初始化（建 profile + 配工具集 + 装 skill）
+#   curl http://localhost:8643/v1/models  # 验证
+#
+# 注意:
+# - 容器内 hermes 路径: /opt/hermes/.venv/bin/hermes
+# - 首次启动后 data 目录是空的，需要 setup.sh 初始化 config
+
+services:
+  hermes:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-intel-planner
+    restart: unless-stopped
+    volumes:
+      # 独立数据目录：config.yaml / .env / sessions / skills / memories
+      - ~/.hermes-intel-planner:/opt/data
+      # 共享情报方法论（只读挂载，供 skill 安装时复制）
+      - ~/Documents/think_tank/entity_intel/INVESTIGATION_METHODOLOGY.md:/opt/methodology/INVESTIGATION_METHODOLOGY.md:ro
+      # 共享 think_tank 项目（爬虫编写时可能需要参考，只读）
+      - ~/Documents/think_tank:/opt/think_tank:ro
+    environment:
+      # 模型 key：从 deploy/intel-planner/.env 读取（专用 key，非宿主机 ~/.hermes/.env）
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      # 注意: API Server 的 key/端口统一在容器内 config.yaml 配置（setup.sh 设置），
+      #       不在 environment 注入 —— 避免环境变量旧值与 .env 不一致导致认证失败
+      HERMES_DASHBOARD: "0"
+      # 禁用记忆（planner 每次会话独立，不需要跨会话记忆）
+      HERMES_MEMORY_ENABLED: "false"
+    ports:
+      - "8643:8643"
+    command: ["gateway", "run"]
