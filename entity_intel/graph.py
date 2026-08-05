@@ -97,99 +97,297 @@ def _load_methodology_snippet() -> str:
 
 
 def plan_node(state: InvestigationState) -> dict:
-    """Plan 阶段：LLM 读方法论，根据实体+hints+goal 动态制定维度模板"""
+    """Plan 阶段（v2 多轮推理）：LLM 读方法论，分步制定维度模板。
+
+    多步推理流程（每步独立 LLM 调用，中间状态保留可追踪）:
+      1. 实体类型分析   → 判断 企业家/公众人物/公司/事件/其他
+      2. 候选维度生成   → 基于实体类型+方法论映射表生成候选维度
+      3. 维度筛选排序   → 按 hints 优先级 + 基线档案永远第一
+      4. 自检合理性     → 检查覆盖度/方法论引用/重叠
+      5. 修正输出       → 自检发现问题则修正，最终输出 JSON
+    """
     logger = _get_logger(state)
     logger.node_start("plan", {"entity": state["entity_name"], "hints": state.get("hints", "")})
     t0 = time.time()
     llm = LLMClient()
     methodology = _load_methodology_snippet()
+    entity = state["entity_name"]
+    hints = state.get("hints", "")
+    goal = state.get("goal", "")
 
+    # ── Step 1: 实体类型分析 ───────────────────────────
+    entity_type, type_reason = _plan_analyze_type(llm, entity, hints, goal)
+    logger.decision("plan", "实体类型", reason=type_reason, detail={"type": entity_type})
+
+    # ── Step 2: 候选维度生成 ───────────────────────────
+    candidates, cand_summary = _plan_generate_candidates(
+        llm, entity, hints, goal, entity_type, methodology
+    )
+    logger.decision("plan", "候选维度", reason=cand_summary,
+                    detail={"dimensions": [d.get("name") for d in candidates]})
+
+    # ── Step 3: 维度筛选排序 ───────────────────────────
+    ranked = _plan_rank_dimensions(llm, entity, hints, goal, entity_type, candidates)
+    logger.decision("plan", "维度排序",
+                    reason=f"{len(ranked)} 个维度",
+                    detail={"dimensions": [d.get("name") for d in ranked]})
+
+    # ── Step 4: 自检合理性 ─────────────────────────────
+    issues = _plan_self_check(llm, entity, hints, goal, ranked, methodology)
+    logger.decision("plan", "自检",
+                    reason=f"{len(issues)} 个问题",
+                    detail={"issues": issues})
+
+    # ── Step 5: 修正输出 ───────────────────────────────
+    final_dims, max_rounds, summary = _plan_fix_and_output(
+        llm, entity, hints, goal, ranked, issues, max_rounds_cap=state.get("max_rounds", 30)
+    )
+    logger.decision(
+        "plan", "制定完成",
+        reason=f"{len(final_dims)} 维度 / {max_rounds} 轮",
+        detail={"dimensions": [d.get("name") for d in final_dims], "summary": summary},
+    )
+    logger.node_end("plan", {"dimensions": len(final_dims), "max_rounds": max_rounds},
+                    duration_ms=(time.time() - t0) * 1000)
+
+    return {
+        "plan": final_dims,
+        "plan_index": 0,
+        "max_rounds": max_rounds,
+        "search_plan": final_dims[0]["queries"],
+        "round": 1,
+        "progress": _add_progress(
+            state, "plan",
+            f"制定调查计划: {len(final_dims)} 维度 / {max_rounds} 轮\n"
+            f"{summary or '; '.join(d['name'] for d in final_dims)}",
+        ),
+    }
+
+
+# ── Plan 多步推理的步骤函数 ────────────────────────────
+
+def _plan_analyze_type(llm, entity: str, hints: str, goal: str) -> tuple[str, str]:
+    """Step 1: 分析实体类型"""
     prompt = f"""
-调查核心实体: {state["entity_name"]}
-用户关注方向: {state.get("hints", "") or "（无）"}
-调查意图: {state.get("goal", "") or "全面调查"}
-最大轮数上限: {state.get("max_rounds", 30)}
+调查核心实体: {entity}
+用户关注方向: {hints or "（无）"}
+调查意图: {goal or "全面调查"}
 
-【调查计划制定方法论】
-{methodology[:8000]}
+请判断该实体的【类型】。输出 JSON:
+{{
+  "type": "person_entrepreneur|person_public|organization|event|location|product|other",
+  "reason": "判断理由（结合实体名特征）",
+  "key_attributes": ["可能的关键属性，如：企业家/作家/明星等"]
+}}
 
-请为本次调查制定【维度模板】。输出 JSON:
+判断规则:
+- person_entrepreneur: 企业家/创业者/投资人（如雷军、马云）
+- person_public: 公众人物/作家/明星/学者（如蒋方舟、韩红）
+- organization: 公司/机构/组织（如小米、字节跳动）
+- event: 事件/争议/历史事件
+- location: 地点/地区
+- product: 产品/品牌
+- other: 其他或不确定
+"""
+    try:
+        data = llm.extract_json(prompt, "请分析实体类型", temperature=0.1, max_tokens=1000)
+        return data.get("type", "other"), data.get("reason", "")
+    except Exception:
+        return "other", "类型分析失败，按通用处理"
+
+
+def _plan_generate_candidates(llm, entity: str, hints: str, goal: str,
+                              entity_type: str, methodology: str) -> tuple[list[dict], str]:
+    """Step 2: 基于实体类型+方法论映射表生成候选维度"""
+    prompt = f"""
+调查核心实体: {entity}
+已判定类型: {entity_type}
+用户关注方向: {hints or "（无）"}
+调查意图: {goal or "全面调查"}
+
+【调查计划制定方法论（含映射表）】
+{methodology[:6000]}
+
+请基于【实体类型】和【方法论映射表】，生成候选调查维度（可多于最终数量，供下一步筛选）。
+输出 JSON:
 {{
   "dimensions": [
     {{
       "name": "维度名",
-      "methodology_source": "引用的方法论来源（如：核心方法论§1 穷尽明面信息）",
-      "rationale": "为什么选这个维度（结合实体特征）",
+      "methodology_source": "引用的方法论来源（必须来自映射表）",
+      "rationale": "为什么选这个维度（结合该实体的具体特征）",
+      "queries": ["搜索角度1", "搜索角度2"],
+      "priority": "high|medium|low"
+    }}
+  ],
+  "summary": "一句话说明候选维度覆盖思路"
+}}
+
+规则:
+1. 每个维度必须能在方法论映射表中找到来源（核心方法论§1-6 / 个人深扒§1-7 / Phase 2-9 / 元数据挖掘）
+2. 生成 5-10 个候选维度（宁多勿少，下一步筛选）
+3. 结合实体类型：企业家侧重资金链/关系网，公众人物侧重言论史/媒体反应，公司侧重工商/利益链条，事件侧重时间线/媒体
+4. 每个维度 2-4 个具体搜索角度（结合实体名，不要泛泛的"搜索 实体名"）
+"""
+    try:
+        data = llm.extract_json(prompt, "请生成候选维度", temperature=0.3, max_tokens=4000)
+        dims = [d for d in data.get("dimensions", []) if d.get("name") and d.get("queries")]
+        return dims, data.get("summary", "")
+    except Exception:
+        return [], "候选维度生成失败"
+
+
+def _plan_rank_dimensions(llm, entity: str, hints: str, goal: str,
+                          entity_type: str, candidates: list[dict]) -> list[dict]:
+    """Step 3: 筛选排序（hints 优先、基线第一、去重叠）"""
+    if not candidates:
+        return [{
+            "name": "基线档案",
+            "methodology_source": "核心方法论§1 穷尽明面信息",
+            "rationale": "兜底：先建立实体基准",
+            "queries": [entity],
+            "priority": "high",
+        }]
+
+    cand_desc = "\n".join(
+        f"- {d.get('name')} [{d.get('priority', 'medium')}] 来源:{d.get('methodology_source', '?')} "
+        f"queries:{d.get('queries', [])}"
+        for d in candidates
+    )
+    prompt = f"""
+调查核心实体: {entity}
+实体类型: {entity_type}
+用户关注方向: {hints or "（无）"}
+调查意图: {goal or "全面调查"}
+
+【候选维度】
+{cand_desc}
+
+请筛选并排序，输出最终维度列表（3-7 个）。输出 JSON:
+{{
+  "dimensions": [
+    {{
+      "name": "维度名",
+      "methodology_source": "引用的方法论来源",
+      "rationale": "为什么保留（结合实体+hints）",
       "queries": ["搜索角度1", "搜索角度2", "搜索角度3"],
       "priority": "high|medium|low"
     }}
   ],
   "max_rounds": 6,
-  "plan_summary": "一句话概述调查路径"
+  "summary": "一句话概述调查路径"
 }}
 
-严格遵守方法论中的【制定规则】:
-1. 每个维度必须能在方法论映射表中找到来源，不得凭空发明
-2. 基线档案永远第一
-3. 3-7 个维度，每个维度 2-4 个搜索角度
-4. 根据实体类型选默认维度集，再按 hints 调整优先级
-5. 维度之间覆盖不同信息层面，避免重叠
-6. max_rounds 不超过 {state.get("max_rounds", 30)}
+规则:
+1. 基线档案（核心方法论§1）永远第一
+2. hints 明确提到的方向 → 提到最前 + high 优先级
+3. 去掉重叠维度（覆盖同一信息层面的只留一个）
+4. 保留 3-7 个，每个 2-4 个搜索角度
+5. 搜索角度要具体（结合实体名），不要泛泛
 """
     try:
-        data = llm.extract_json(prompt, "请制定调查计划", temperature=0.3, max_tokens=4000)
-        dimensions = data.get("dimensions", [])
-        # 过滤：必须有 name 和 queries
-        dimensions = [d for d in dimensions if d.get("name") and d.get("queries")]
-        if not dimensions:
-            # 兜底：单维度基线档案
-            dimensions = [{
-                "name": "基线档案",
-                "methodology_source": "核心方法论§1 穷尽明面信息",
-                "rationale": "兜底计划：先建立实体基准",
-                "queries": [state["entity_name"]],
-                "priority": "high",
-            }]
-        max_rounds = int(data.get("max_rounds", 6))
-        max_rounds = max(1, min(max_rounds, state.get("max_rounds", 30)))
-    except Exception as e:
-        dimensions = [{
-            "name": "基线档案",
-            "methodology_source": "核心方法论§1 穷尽明面信息",
-            "rationale": f"LLM 计划失败，兜底: {str(e)[:50]}",
-            "queries": [state["entity_name"]],
-            "priority": "high",
-        }]
-        max_rounds = min(state.get("max_rounds", 30), 6)
-
-    summary = ""
-    data = None
-    try:
-        if 'data' in dir():
-            data = locals().get('data')
+        data = llm.extract_json(prompt, "请筛选排序维度", temperature=0.2, max_tokens=4000)
+        dims = [d for d in data.get("dimensions", []) if d.get("name") and d.get("queries")]
+        return dims if dims else candidates[:5]
     except Exception:
-        pass
-    if data and data.get("plan_summary"):
-        summary = data["plan_summary"]
-    logger.decision(
-        "plan", "制定完成",
-        reason=f"{len(dimensions)} 维度 / {max_rounds} 轮",
-        detail={"dimensions": [d.get("name") for d in dimensions], "summary": summary},
+        return candidates[:5]
+
+
+def _plan_self_check(llm, entity: str, hints: str, goal: str,
+                     dimensions: list[dict], methodology: str) -> list[str]:
+    """Step 4: 自检合理性（覆盖度/方法论引用/重叠）"""
+    if not dimensions:
+        return ["无维度"]
+
+    dim_desc = "\n".join(
+        f"- {d.get('name')} 来源:{d.get('methodology_source', '?')} priority:{d.get('priority', '?')}"
+        for d in dimensions
     )
-    logger.node_end("plan", {"dimensions": len(dimensions), "max_rounds": max_rounds},
-                    duration_ms=(time.time() - t0) * 1000)
-    return {
-        "plan": dimensions,
-        "plan_index": 0,
-        "max_rounds": max_rounds,
-        "search_plan": dimensions[0]["queries"],
-        "round": 1,
-        "progress": _add_progress(
-            state, "plan",
-            f"制定调查计划: {len(dimensions)} 维度 / {max_rounds} 轮\n"
-            f"{summary or '; '.join(d['name'] for d in dimensions)}",
-        ),
-    }
+    prompt = f"""
+调查核心实体: {entity}
+用户关注方向: {hints or "（无）"}
+
+【已制定的维度】
+{dim_desc}
+
+请检查这个调查计划是否存在问题。输出 JSON:
+{{
+  "issues": [
+    {{"issue": "问题描述", "severity": "high|medium|low", "suggestion": "修正建议"}}
+  ]
+}}
+
+检查维度:
+1. 覆盖度: 是否遗漏了该实体类型关键的信息层面？（企业家漏资金链？公众人物漏言论史？）
+2. 方法论引用: 每个维度是否真的能在方法论映射表找到来源？
+3. 重叠: 是否有两个维度在挖同一类信息？
+4. hints 响应: 用户关注方向是否被充分覆盖？
+5. 具体性: 搜索角度是否太泛（如只有"搜实体名"）？
+"""
+    try:
+        data = llm.extract_json(prompt, "请自检调查计划", temperature=0.1, max_tokens=2000)
+        issues = [
+            f"[{i.get('severity', 'low')}] {i.get('issue', '')} → {i.get('suggestion', '')}"
+            for i in data.get("issues", [])
+            if i.get("issue")
+        ]
+        return issues
+    except Exception:
+        return []
+
+
+def _plan_fix_and_output(llm, entity: str, hints: str, goal: str,
+                         dimensions: list[dict], issues: list[str],
+                         max_rounds_cap: int = 30) -> tuple[list[dict], int, str]:
+    """Step 5: 根据自检问题修正，输出最终模板"""
+    # 无自检问题 → 直接用
+    if not issues:
+        max_rounds = max(1, min(len(dimensions) + 1, max_rounds_cap))
+        return dimensions, max_rounds, f"自检通过: {len(dimensions)} 维度"
+
+    # 有自检问题 → 让 LLM 修正
+    dim_desc = "\n".join(
+        f"- {d.get('name')} 来源:{d.get('methodology_source', '?')} queries:{d.get('queries', [])}"
+        for d in dimensions
+    )
+    issues_desc = "\n".join(f"- {i}" for i in issues)
+    prompt = f"""
+调查核心实体: {entity}
+用户关注方向: {hints or "（无）"}
+
+【当前维度】
+{dim_desc}
+
+【自检发现的问题】
+{issues_desc}
+
+请根据问题修正维度模板。输出修正后的 JSON:
+{{
+  "dimensions": [
+    {{
+      "name": "维度名",
+      "methodology_source": "引用的方法论来源",
+      "rationale": "为什么保留",
+      "queries": ["搜索角度1", "搜索角度2", "搜索角度3"],
+      "priority": "high|medium|low"
+    }}
+  ],
+  "max_rounds": 6,
+  "summary": "修正后的一句话概述"
+}}
+
+规则: 修正时优先解决 high severity 问题；保持 3-7 个维度；基线档案永远第一。
+"""
+    try:
+        data = llm.extract_json(prompt, "请修正调查计划", temperature=0.2, max_tokens=4000)
+        dims = [d for d in data.get("dimensions", []) if d.get("name") and d.get("queries")]
+        if dims:
+            max_rounds = int(data.get("max_rounds", len(dims) + 1))
+            max_rounds = max(1, min(max_rounds, max_rounds_cap))
+            return dims, max_rounds, data.get("summary", "已按自检问题修正")
+        return dimensions, max(1, min(len(dimensions) + 1, max_rounds_cap)), "修正失败，保留原计划"
+    except Exception:
+        return dimensions, max(1, min(len(dimensions) + 1, max_rounds_cap)), "修正失败，保留原计划"
 
 
 def _merge_reports(target: EntityReport, new: EntityReport):
