@@ -8,7 +8,7 @@ from shared.crawlers.web_search import SerperProvider
 from shared.crawlers.bilibili import BilibiliCLIProvider
 from shared.crawlers.knowledge import WikipediaProvider
 from shared.models.entity_report import EntityReport
-from shared.utils.logger import archive_search_results
+from shared.utils.logger import archive_search_results, get_current_logger
 
 
 class EntitySearcher:
@@ -126,6 +126,7 @@ class EntitySearcher:
         # 并行调用所有 Provider
         results: dict[str, list[SearchResult]] = {}
         errors: dict[str, str] = {}
+        logger = get_current_logger()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_map = {
@@ -135,9 +136,14 @@ class EntitySearcher:
             for future in concurrent.futures.as_completed(future_map):
                 name = future_map[future]
                 try:
-                    results[name] = future.result()
+                    items = future.result()
+                    results[name] = items
+                    logger.provider_result(
+                        name, entity_name, count=len(items),
+                    )
                 except Exception as e:
                     errors[name] = str(e)
+                    logger.provider_result(name, entity_name, count=0, error=str(e)[:200])
 
         report.errors = errors
 
@@ -180,6 +186,7 @@ class EntitySearcher:
         params = SearchParams(query=entity_name, max_results=max_per_source)
         results: dict[str, list[SearchResult]] = {}
         errors: dict[str, str] = {}
+        logger = get_current_logger()
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
             future_map = {
@@ -190,9 +197,12 @@ class EntitySearcher:
             for future in concurrent.futures.as_completed(future_map):
                 name = future_map[future]
                 try:
-                    results[name] = future.result()
+                    items = future.result()
+                    results[name] = items
+                    logger.provider_result(name, entity_name, count=len(items))
                 except Exception as e:
                     errors[name] = str(e)
+                    logger.provider_result(name, entity_name, count=0, error=str(e)[:200])
 
         report.errors = errors
         for source_name, items in results.items():

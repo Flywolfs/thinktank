@@ -37,8 +37,14 @@ class LLMClient:
         max_tokens: int = 2000,
     ) -> str:
         """发送对话请求，返回模型回复文本"""
+        import time as _time
+        from shared.utils.logger import get_current_logger
+
+        logger = get_current_logger()
+        t0 = _time.time()
+        model_name = model or self.default_model
         payload = {
-            "model": model or self.default_model,
+            "model": model_name,
             "messages": messages,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -46,18 +52,33 @@ class LLMClient:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        r = httpx.post(
-            f"{self.base_url}/chat/completions",
-            json=payload,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            timeout=60,
-        )
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
+        # prompt 摘要（system 前 300 字符 + user 前 300 字符）
+        prompt_chars = sum(len(m.get("content", "")) for m in messages)
+        try:
+            r = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            data = r.json()
+            content = data["choices"][0]["message"]["content"]
+            logger.llm_call(
+                model_name, prompt_chars=prompt_chars, response=content,
+                duration_ms=(_time.time() - t0) * 1000,
+                temperature=temperature, max_tokens=max_tokens, json_mode=json_mode,
+            )
+            return content
+        except Exception as e:
+            logger.llm_call(
+                model_name, prompt_chars=prompt_chars, response="",
+                error=str(e)[:300], duration_ms=(_time.time() - t0) * 1000,
+            )
+            raise
 
     def extract_json(
         self,

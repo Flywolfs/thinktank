@@ -64,13 +64,17 @@ class _MediaCrawlerBase(BaseProvider):
         if cookie:
             cmd += ["--cookies", cookie]
         try:
+            # 用 bytes 模式 + errors='replace' 容错解码：
+            # MediaCrawler rich 日志可能含非 UTF-8 字节，text=True 会抛 UnicodeDecodeError
             result = subprocess.run(
                 cmd,
                 cwd=str(MEDIACRAWLER_DIR),
                 capture_output=True,
-                text=True,
                 timeout=timeout,
             )
+            # 容错解码（日志只用于调试，坏字节替换即可）
+            _ = result.stdout.decode("utf-8", errors="replace") if result.stdout else ""
+            _ = result.stderr.decode("utf-8", errors="replace") if result.stderr else ""
         except subprocess.TimeoutExpired:
             # 超时但可能已写了部分数据
             pass
@@ -82,7 +86,11 @@ class _MediaCrawlerBase(BaseProvider):
         if out_dir.exists():
             raw_lines = []  # 收集本次所有 jsonl 原始行
             for f in out_dir.glob("*.jsonl"):
-                for line in f.read_text(encoding="utf-8").strip().splitlines():
+                try:
+                    content = f.read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                for line in content.strip().splitlines():
                     if line.strip():
                         raw_lines.append(line.strip())
                         try:

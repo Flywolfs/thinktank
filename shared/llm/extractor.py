@@ -95,11 +95,15 @@ class EntityExtractor:
 
     def extract(self, text: str, entity_name: str = "") -> ExtractionResult:
         """从一段文本中抽取实体和关系"""
+        from shared.utils.logger import get_current_logger
+        logger = get_current_logger()
+
         user_input = f"核心实体: {entity_name}\n\n文本:\n{text[:4000]}"
 
         try:
             data = self.llm.extract_json(EXTRACT_PROMPT, user_input, max_tokens=4000)
         except (json.JSONDecodeError, Exception) as e:
+            logger.extract_result(0, error=str(e)[:200])
             return ExtractionResult(raw_json={"error": str(e)})
 
         core = data.get("core_entity", {})
@@ -115,6 +119,12 @@ class EntityExtractor:
             if r.get("name")
         ]
         events = data.get("events", [])
+
+        logger.extract_result(
+            len(related),
+            entities=[f"{r.name}({r.type})" for r in related[:10]],
+            error="",
+        )
 
         return ExtractionResult(
             core_entity=core,

@@ -641,7 +641,14 @@ def run_investigation(
         "job_id": job_id or thread_id,
     }
 
+    # 设置全局 logger 上下文（节点执行时 searcher/llm client 通过它记录代码级日志）
+    from shared.utils.logger import InvestigationLogger, set_current_logger
+    _logger = InvestigationLogger(job_id=job_id or thread_id, thread_id=thread_id)
+    set_current_logger(_logger)
+
     result = get_graph().invoke(initial, config)
+    # 清除全局 logger 上下文（调查结束）
+    set_current_logger(None)
     return result, thread_id
 
 
