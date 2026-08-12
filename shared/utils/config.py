@@ -43,6 +43,15 @@ WEIBO_COOKIE = get("WEIBO_COOKIE")
 DEEPSEEK_API_KEY = get("DEEPSEEK_API_KEY")
 DOUBAO_API_KEY = get("DOUBAO_API_KEY")
 
+# ── Plan Provider（P0.3 融合方案）───────────────────────
+# 模式: auto(默认, Hermes优先失败降级) | hermes(强制) | local(仅自研)
+
+PLAN_PROVIDER = get("PLAN_PROVIDER", "auto")
+HERMES_API_URL = get("HERMES_API_URL", "http://localhost:8643")
+HERMES_API_KEY = get("HERMES_API_KEY", "")
+HERMES_PLAN_MODEL = get("HERMES_PLAN_MODEL", "intel-planner")
+HERMES_PLAN_TIMEOUT = int(get("HERMES_PLAN_TIMEOUT", "180"))
+
 # ── ASR ────────────────────────────────────────────────
 
 QWEN3_ASR_URL = get("QWEN3_ASR_URL", "http://localhost:8000")

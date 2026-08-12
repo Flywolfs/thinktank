@@ -27,6 +27,7 @@ from shared.models.analysis_report import AnalysisReport
 from shared.models.entity_report import EntityReport
 from shared.models.leads import Lead, LeadQueue
 from shared.llm.client import LLMClient
+from shared.utils import config
 
 _CHECKPOINT_DIR = Path(__file__).parent.parent / "data"
 _CHECKPOINT_DB = _CHECKPOINT_DIR / "checkpoints.db"
@@ -96,59 +97,98 @@ def _load_methodology_snippet() -> str:
         return ""
 
 
-def plan_node(state: InvestigationState) -> dict:
-    """Plan 阶段（v2 多轮推理）：LLM 读方法论，分步制定维度模板。
+def _local_plan_generator(entity: str, hints: str = "", goal: str = "") -> dict:
+    """Local 路线（路线A）: 现有 5 步多轮推理生成 plan。
 
-    多步推理流程（每步独立 LLM 调用，中间状态保留可追踪）:
-      1. 实体类型分析   → 判断 企业家/公众人物/公司/事件/其他
-      2. 候选维度生成   → 基于实体类型+方法论映射表生成候选维度
-      3. 维度筛选排序   → 按 hints 优先级 + 基线档案永远第一
-      4. 自检合理性     → 检查覆盖度/方法论引用/重叠
-      5. 修正输出       → 自检发现问题则修正，最终输出 JSON
+    供 PlanProvider 降级调用。输出统一 {dimensions, max_rounds, plan_summary}。
+    """
+    from shared.llm.client import LLMClient
+
+    llm = LLMClient()
+    methodology = _load_methodology_snippet()
+
+    entity_type, type_reason = _plan_analyze_type(llm, entity, hints, goal)
+    candidates, cand_summary = _plan_generate_candidates(
+        llm, entity, hints, goal, entity_type, methodology
+    )
+    ranked = _plan_rank_dimensions(llm, entity, hints, goal, entity_type, candidates)
+    issues = _plan_self_check(llm, entity, hints, goal, ranked, methodology)
+    final_dims, max_rounds, summary = _plan_fix_and_output(
+        llm, entity, hints, goal, ranked, issues, max_rounds_cap=30
+    )
+    return {
+        "dimensions": final_dims,
+        "max_rounds": max_rounds,
+        "plan_summary": summary,
+    }
+
+
+def plan_node(state: InvestigationState) -> dict:
+    """Plan 阶段（P0.3 融合版）：PlanProvider 策略选择。
+
+    模式（PLAN_PROVIDER env）:
+      auto  (默认) → Hermes 优先，失败/校验不过 → 降级 Local 5步推理
+      hermes       → 强制 Docker Hermes，失败报错
+      local        → 只用自研 5 步推理（离线/省成本）
+
+    所有路线输出都经 PlanValidator 统一校验（结构/方法论合法性/基线第一/query 具体性）。
     """
     logger = _get_logger(state)
     logger.node_start("plan", {"entity": state["entity_name"], "hints": state.get("hints", "")})
     t0 = time.time()
-    llm = LLMClient()
-    methodology = _load_methodology_snippet()
     entity = state["entity_name"]
     hints = state.get("hints", "")
     goal = state.get("goal", "")
 
-    # ── Step 1: 实体类型分析 ───────────────────────────
-    entity_type, type_reason = _plan_analyze_type(llm, entity, hints, goal)
-    logger.decision("plan", "实体类型", reason=type_reason, detail={"type": entity_type})
+    from shared.plan.provider import PlanGenerationError, PlanProvider
+    from shared.plan.validator import PlanValidator
 
-    # ── Step 2: 候选维度生成 ───────────────────────────
-    candidates, cand_summary = _plan_generate_candidates(
-        llm, entity, hints, goal, entity_type, methodology
+    provider = PlanProvider(
+        mode=config.PLAN_PROVIDER,
+        validator=PlanValidator(),
+        local_generator=_local_plan_generator,
     )
-    logger.decision("plan", "候选维度", reason=cand_summary,
-                    detail={"dimensions": [d.get("name") for d in candidates]})
 
-    # ── Step 3: 维度筛选排序 ───────────────────────────
-    ranked = _plan_rank_dimensions(llm, entity, hints, goal, entity_type, candidates)
-    logger.decision("plan", "维度排序",
-                    reason=f"{len(ranked)} 个维度",
-                    detail={"dimensions": [d.get("name") for d in ranked]})
+    try:
+        plan = provider.generate(entity, hints, goal)
+    except PlanGenerationError as e:
+        logger.error("plan", f"plan 生成失败: {e}")
+        # 兜底：单维度最小计划，保证流程可继续
+        fallback = {
+            "dimensions": [{
+                "name": "基线档案",
+                "methodology_source": "核心方法论§1 穷尽明面信息",
+                "rationale": f"兜底计划：建立 {entity} 基准",
+                "queries": [f"{entity} 维基百科", f"{entity} 百度百科"],
+                "priority": "high",
+            }],
+            "max_rounds": 2,
+            "plan_summary": f"兜底计划（{e}）",
+            "provider": "fallback",
+        }
+        plan = fallback
 
-    # ── Step 4: 自检合理性 ─────────────────────────────
-    issues = _plan_self_check(llm, entity, hints, goal, ranked, methodology)
-    logger.decision("plan", "自检",
-                    reason=f"{len(issues)} 个问题",
-                    detail={"issues": issues})
+    final_dims = plan["dimensions"]
+    max_rounds = int(plan.get("max_rounds") or len(final_dims) + 1)
+    max_rounds = max(1, min(max_rounds, state.get("max_rounds", 30)))
+    summary = plan.get("plan_summary", "")
+    provider_used = plan.get("provider", "?")
 
-    # ── Step 5: 修正输出 ───────────────────────────────
-    final_dims, max_rounds, summary = _plan_fix_and_output(
-        llm, entity, hints, goal, ranked, issues, max_rounds_cap=state.get("max_rounds", 30)
-    )
     logger.decision(
         "plan", "制定完成",
-        reason=f"{len(final_dims)} 维度 / {max_rounds} 轮",
-        detail={"dimensions": [d.get("name") for d in final_dims], "summary": summary},
+        reason=f"{len(final_dims)} 维度 / {max_rounds} 轮 / provider={provider_used}",
+        detail={
+            "dimensions": [d.get("name") for d in final_dims],
+            "summary": summary,
+            "provider": provider_used,
+            "elapsed_s": round(time.time() - t0, 1),
+        },
     )
-    logger.node_end("plan", {"dimensions": len(final_dims), "max_rounds": max_rounds},
-                    duration_ms=(time.time() - t0) * 1000)
+    logger.node_end("plan", {
+        "dimensions": len(final_dims),
+        "max_rounds": max_rounds,
+        "provider": provider_used,
+    }, duration_ms=(time.time() - t0) * 1000)
 
     return {
         "plan": final_dims,
@@ -158,7 +198,8 @@ def plan_node(state: InvestigationState) -> dict:
         "round": 1,
         "progress": _add_progress(
             state, "plan",
-            f"制定调查计划: {len(final_dims)} 维度 / {max_rounds} 轮\n"
+            f"制定调查计划: {len(final_dims)} 维度 / {max_rounds} 轮 "
+            f"(provider={provider_used})\n"
             f"{summary or '; '.join(d['name'] for d in final_dims)}",
         ),
     }
