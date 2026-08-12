@@ -65,6 +65,7 @@ class ToolCallRecord:
     """工具调用留痕（P1.3 审计基础）"""
     tool: str
     params: dict
+    job_id: str = ""                 # 所属调查任务（回放按 job 过滤）
     ts: float = field(default_factory=time.time)
     duration_s: float = 0.0
     status: str = "ok"           # ok / error
@@ -74,6 +75,7 @@ class ToolCallRecord:
     def to_dict(self) -> dict:
         return {
             "tool": self.tool,
+            "job_id": self.job_id,
             "params": {k: (v if not isinstance(v, (dict, list)) else "<obj>") for k, v in self.params.items()},
             "ts": self.ts,
             "duration_s": round(self.duration_s, 2),
@@ -121,14 +123,14 @@ class ToolRegistry:
 
     # ── 调用（带审计） ─────────────────────────────────
 
-    def call(self, name: str, **params) -> Any:
+    def call(self, name: str, job_id: str = "", **params) -> Any:
         """调用工具：执行 handler + 记录审计。抛 ToolNotFoundError / 透传 handler 异常"""
         if name not in self._handlers:
             raise ToolNotFoundError(f"工具未注册: {name}")
 
         handler = self._handlers[name]
         spec = self._tools[name]
-        record = ToolCallRecord(tool=name, params=params)
+        record = ToolCallRecord(tool=name, params=params, job_id=job_id)
         t0 = time.time()
         logger = get_current_logger()
 
@@ -158,9 +160,12 @@ class ToolRegistry:
 
     # ── 审计 ───────────────────────────────────────────
 
-    def audit(self, limit: int = 50) -> list[dict]:
-        """本次会话的工具调用记录（回放用）"""
-        return [r.to_dict() for r in self._audit[-limit:]]
+    def audit(self, limit: int = 50, job_id: str = "") -> list[dict]:
+        """工具调用记录（回放用）。job_id 非空时只返回该任务的记录"""
+        records = self._audit
+        if job_id:
+            records = [r for r in records if r.job_id == job_id]
+        return [r.to_dict() for r in records[-limit:]]
 
     def clear_audit(self) -> None:
         self._audit = []
@@ -201,11 +206,111 @@ def get_registry() -> ToolRegistry:
 
 
 def build_default_registry() -> ToolRegistry:
-    """构建默认工具集：7 个爬虫 Provider + 处理步骤"""
+    """构建默认工具集：7 个爬虫 Provider + 处理步骤 + 图执行级聚合工具"""
     reg = ToolRegistry()
     _register_crawlers(reg)
     _register_processors(reg)
+    _register_graph_tools(reg)
     return reg
+
+
+def _register_graph_tools(reg: ToolRegistry) -> None:
+    """图执行级聚合工具（P1.2：调查图节点通过 registry 调用，独立可调用+留痕）"""
+    from entity_intel.searcher import EntitySearcher
+    from shared.llm.extractor import EntityExtractor
+
+    searcher = EntitySearcher()
+
+    # 全源搜索（对应 searcher.search，含 MediaCrawler）
+    reg.register(
+        ToolSpec(
+            name="search_all",
+            description="全源聚合搜索：知识库+搜索引擎+B站+企业+知乎+小红书+微博，返回 EntityReport。",
+            category="crawler", cost="high", provider="multi",
+            parameters=[
+                ToolParam("query", "string", "搜索关键词"),
+                ToolParam("max_per_source", "int", "每源最多条数", required=False, default=10),
+            ],
+        ),
+        lambda query, max_per_source=10: searcher.search(query, max_per_source=max_per_source),
+    )
+
+    # 快速搜索（跳过 MediaCrawler 慢源，用于一轮中后续 query）
+    reg.register(
+        ToolSpec(
+            name="search_all_fast",
+            description="快速聚合搜索：跳过知乎/小红书/微博（慢源），适合多关键词轮转。",
+            category="crawler", cost="medium", provider="multi",
+            parameters=[
+                ToolParam("query", "string", "搜索关键词"),
+                ToolParam("max_per_source", "int", "每源最多条数", required=False, default=10),
+            ],
+        ),
+        lambda query, max_per_source=10: searcher.search_fast(query, max_per_source=max_per_source),
+    )
+
+    # 报告级相关性筛选（对应 filter_entity_report）
+    def filter_report_handler(report, hints: str = "", goal: str = "", use_llm: bool = True):
+        from entity_intel.relevance import filter_entity_report
+        return filter_entity_report(report, hints=hints, goal=goal, use_llm=use_llm)
+
+    reg.register(
+        ToolSpec(
+            name="filter_report",
+            description="报告级相关性筛选：对 EntityReport 整体筛选，返回保留/丢弃统计。",
+            category="filter", cost="medium", provider="rules+deepseek",
+            parameters=[
+                ToolParam("hints", "string", "用户关注方向", required=False, default=""),
+                ToolParam("goal", "string", "调查意图", required=False, default=""),
+            ],
+        ),
+        filter_report_handler,
+    )
+
+    # 报告级实体抽取（对应 extract_from_report）
+    reg.register(
+        ToolSpec(
+            name="extract_report",
+            description="报告级实体抽取：从 EntityReport 中提取实体/关系/证据（5元组），填充 related_entities。",
+            category="extract", cost="medium", provider="deepseek",
+            parameters=[],
+        ),
+        lambda report: EntityExtractor().extract_from_report(report),
+    )
+
+    # 知识图谱全量构建（对应 graph_build_node）
+    def graph_build_handler(report, analysis, entity_name: str):
+        from shared.storage.neo4j_client import Neo4jClient
+        client = Neo4jClient()
+        client.ensure_indexes()
+        client.merge_entity(
+            entity_name, entity_type="person",
+            summary=(analysis.entity_summary or "")[:500],
+            source="investigation",
+        )
+        for e in (analysis.suggested_entities or []):
+            client.merge_entity(
+                e.get("name", ""), entity_type=e.get("type", ""), source="investigation"
+            )
+        rel_count = 0
+        for r in (analysis.suggested_relations or []):
+            frm, to, rel = r.get("from", ""), r.get("to", ""), r.get("relation", "")
+            if frm and to and rel:
+                client.merge_relation(frm, to, rel, source="investigation")
+                rel_count += 1
+        return {"entities": len(analysis.suggested_entities or []), "relations": rel_count}
+
+    reg.register(
+        ToolSpec(
+            name="graph_build",
+            description="知识图谱全量构建：实体+关系 merge 进 Neo4j，返回构建统计。",
+            category="graph", cost="medium", provider="neo4j",
+            parameters=[ToolParam("entity_name", "string", "核心实体名")],
+        ),
+        lambda entity_name, report=None, analysis=None: graph_build_handler(
+            report, analysis, entity_name
+        ),
+    )
 
 
 def _register_crawlers(reg: ToolRegistry) -> None:
@@ -363,7 +468,7 @@ def _register_processors(reg: ToolRegistry) -> None:
                 ToolParam("goal", "string", "调查意图", required=False, default=""),
             ],
         ),
-        lambda entity, hints="", goal="": _synthesize_handler(entity, hints=hints, goal=goal),
+        lambda entity, hints="", goal="", report=None: _synthesize_handler(entity, hints=hints, goal=goal, report=report),
     )
 
     # 知识图谱
@@ -382,13 +487,13 @@ def _register_processors(reg: ToolRegistry) -> None:
     )
 
 
-def _synthesize_handler(entity: str, hints: str = "", goal: str = ""):
-    """独立报告生成（不依赖整个调查图）"""
+def _synthesize_handler(entity: str, hints: str = "", goal: str = "", report=None):
+    """独立报告生成（不依赖整个调查图）。report 为空时用空报告（仅实体名）"""
     from entity_intel.searcher import EntitySearcher
     from shared.models.entity_report import EntityReport
-    return EntitySearcher().synthesize(
-        EntityReport(entity_name=entity), hints=hints, goal=goal
-    )
+    if report is None:
+        report = EntityReport(entity_name=entity)
+    return EntitySearcher().synthesize(report, hints=hints, goal=goal)
 
 
 def _graph_merge_handler(entity: str, relation: str = "", target: str = ""):

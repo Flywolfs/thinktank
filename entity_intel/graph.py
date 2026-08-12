@@ -452,15 +452,16 @@ def _merge_reports(target: EntityReport, new: EntityReport):
 # ── 节点实现 ──────────────────────────────────────────
 
 def search_node(state: InvestigationState) -> dict:
-    """按搜索计划多角度搜索，结果累积到 report。
+    """按搜索计划多角度搜索，结果累积到 report（走 Tool Registry，留痕）。
     性能策略: 第1个 query 用全源（含 MediaCrawler），
     其余 query 用快速源（跳过 MediaCrawler，避免重复爬取和输出目录冲突）。"""
     import concurrent.futures
-    from entity_intel.searcher import EntitySearcher
+    from shared.tools.registry import get_registry
 
     logger = _get_logger(state)
     t0 = time.time()
-    searcher = EntitySearcher()
+    reg = get_registry()
+    job_id = state.get("job_id", "")
     plan = state.get("search_plan") or [state["entity_name"]]
     report = state.get("report") or EntityReport(entity_name=state["entity_name"])
 
@@ -474,22 +475,20 @@ def search_node(state: InvestigationState) -> dict:
     if queries:
         q0 = queries[0]
         try:
-            r = searcher.search(q0, max_per_source=10)
+            r = reg.call("search_all", job_id=job_id, query=q0, max_per_source=10)
             _merge_reports(report, r)
             details.append(f"'{q0}'+{r.total_results}")
             if q0 not in visited:
                 visited.append(q0)
-            logger.tool_call("search_full", {"query": q0}, result_summary=f"{r.total_results} 条")
         except Exception as e:
             details.append(f"'{q0}'✗{str(e)[:40]}")
-            logger.tool_call("search_full", {"query": q0}, error=str(e)[:200])
 
     # 其余 query：快速源并行（无 MediaCrawler）
     rest = queries[1:]
     if rest:
         def _fast_search(q: str) -> tuple[str, int, str]:
             try:
-                r = searcher.search_fast(q, max_per_source=10)
+                r = reg.call("search_all_fast", job_id=job_id, query=q, max_per_source=10)
                 return q, r.total_results, ""
             except Exception as e:
                 return q, 0, str(e)[:40]
@@ -500,18 +499,15 @@ def search_node(state: InvestigationState) -> dict:
                 q, cnt, err = fut.result()
                 if err:
                     details.append(f"'{q}'✗{err}")
-                    logger.tool_call("search_fast", {"query": q}, error=err)
                 else:
                     try:
-                        r = searcher.search_fast(q, max_per_source=10)
+                        r = reg.call("search_all_fast", job_id=job_id, query=q, max_per_source=10)
                         _merge_reports(report, r)
                         details.append(f"'{q}'+{r.total_results}")
                         if q not in visited:
                             visited.append(q)
-                        logger.tool_call("search_fast", {"query": q}, result_summary=f"{r.total_results} 条")
                     except Exception as e:
                         details.append(f"'{q}'✗{str(e)[:40]}")
-                        logger.tool_call("search_fast", {"query": q}, error=str(e)[:200])
 
     logger.node_end("search", {"queries": len(queries), "results": len(details)},
                     duration_ms=(time.time() - t0) * 1000)
@@ -526,11 +522,15 @@ def search_node(state: InvestigationState) -> dict:
 
 
 def filter_node(state: InvestigationState) -> dict:
-    """相关性筛选（对累积的 report 整体筛）"""
-    from entity_intel.relevance import filter_entity_report
+    """相关性筛选（走 Tool Registry，留痕）"""
+    from shared.tools.registry import get_registry
 
     report = state["report"]
-    filter_entity_report(report, hints=state["hints"], goal=state["goal"])
+    reg = get_registry()
+    reg.call(
+        "filter_report", job_id=state.get("job_id", ""),
+        report=report, hints=state["hints"], goal=state["goal"],
+    )
     kept = report.metadata.get("filtered", {}).get("final_kept", 0)
     return {
         "report": report,
@@ -539,11 +539,11 @@ def filter_node(state: InvestigationState) -> dict:
 
 
 def extract_node(state: InvestigationState) -> dict:
-    """LLM 实体抽取（对累积结果）"""
-    from shared.llm.extractor import EntityExtractor
+    """LLM 实体抽取（走 Tool Registry，留痕）"""
+    from shared.tools.registry import get_registry
 
     report = state["report"]
-    EntityExtractor().extract_from_report(report)
+    get_registry().call("extract_report", job_id=state.get("job_id", ""), report=report)
     return {
         "report": report,
         "progress": _add_progress(
@@ -705,14 +705,16 @@ def analyze_leads_node(state: InvestigationState) -> dict:
 
 
 def synthesize_node(state: InvestigationState) -> dict:
-    """信息整合推理 → 最终分析报告（基于累积结果）"""
-    from entity_intel.synthesizer import Synthesizer
+    """信息整合推理 → 最终分析报告（走 Tool Registry，留痕）"""
+    from shared.tools.registry import get_registry
 
     logger = _get_logger(state)
     t0 = time.time()
     report = state["report"]
-    analysis = Synthesizer().synthesize(
-        report, hints=state["hints"], goal=state["goal"]
+    analysis = get_registry().call(
+        "synthesize_report", job_id=state.get("job_id", ""),
+        entity=state["entity_name"], hints=state["hints"], goal=state["goal"],
+        report=report,
     )
     logger.node_end("synthesize",
                     {"logical_chains": len(analysis.logical_chains),
@@ -749,34 +751,19 @@ def review_node(state: InvestigationState) -> dict:
 
 
 def graph_build_node(state: InvestigationState) -> dict:
-    """构建 Neo4j 知识图谱"""
-    from shared.storage.neo4j_client import Neo4jClient
+    """构建 Neo4j 知识图谱（走 Tool Registry，留痕）"""
+    from shared.tools.registry import get_registry
 
     analysis = state["analysis"]
-    client = Neo4jClient()
-    client.ensure_indexes()
-
-    client.merge_entity(
-        state["entity_name"],
-        entity_type="person",
-        summary=analysis.entity_summary[:500],
-        source="investigation",
+    stats = get_registry().call(
+        "graph_build", job_id=state.get("job_id", ""),
+        entity_name=state["entity_name"], report=state["report"], analysis=analysis,
     )
-    for e in analysis.suggested_entities:
-        client.merge_entity(
-            e.get("name", ""), entity_type=e.get("type", ""), source="investigation"
-        )
-    rel_count = 0
-    for r in analysis.suggested_relations:
-        frm, to, rel = r.get("from", ""), r.get("to", ""), r.get("relation", "")
-        if frm and to and rel:
-            client.merge_relation(frm, to, rel, source="investigation")
-            rel_count += 1
 
     return {
         "progress": _add_progress(
             state, "graph_done",
-            f"图谱构建完成: {len(analysis.suggested_entities)} 实体, {rel_count} 关系",
+            f"图谱构建完成: {stats['entities']} 实体, {stats['relations']} 关系",
         ),
     }
 
