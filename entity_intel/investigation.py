@@ -24,6 +24,7 @@ class InvestigationJob:
     entity_name: str = ""
     hints: str = ""
     goal: str = ""
+    plan_provider: str = ""             # auto/hermes/local（空=config 默认）
     status: str = "pending"           # pending/running/review/approved/rejected/error
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -47,6 +48,7 @@ class InvestigationJob:
             "entity_name": self.entity_name,
             "hints": self.hints,
             "goal": self.goal,
+            "plan_provider": self.plan_provider,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -113,13 +115,15 @@ class InvestigationManager:
     # ── 用户操作 ───────────────────────────────────────
 
     def start(
-        self, entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30
+        self, entity_name: str, hints: str = "", goal: str = "",
+        max_rounds: int = 30, plan_provider: str = "",
     ) -> InvestigationJob:
         """启动一次调查（多轮深挖），执行到 review 暂停点"""
         job = InvestigationJob(
             entity_name=entity_name,
             hints=hints,
             goal=goal,
+            plan_provider=plan_provider,
             status="running",
         )
         job.add_progress("start", f"开始调查实体: {entity_name} (最多 {max_rounds} 轮深挖)")
@@ -130,7 +134,7 @@ class InvestigationManager:
 
             result, thread_id = run_investigation(
                 entity_name, hints=hints, goal=goal, max_rounds=max_rounds,
-                job_id=job.id,
+                job_id=job.id, plan_provider=plan_provider,
             )
 
             # 从图状态同步结果

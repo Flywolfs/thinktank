@@ -40,6 +40,7 @@ class InvestigateRequest(BaseModel):
     hints: str = ""
     goal: str = ""
     max_rounds: int = 30
+    plan_provider: str = ""     # auto/hermes/local（空=config 默认 auto）
 
 
 # ── 调查流程 API ──────────────────────────────────────
@@ -50,14 +51,19 @@ def investigate(req: InvestigateRequest):
     if not req.entity_name.strip():
         raise HTTPException(400, "entity_name 不能为空")
 
+    provider = (req.plan_provider or "").strip().lower()
+    if provider and provider not in ("auto", "hermes", "local"):
+        raise HTTPException(400, f"plan_provider 非法: {provider}（可选 auto/hermes/local）")
+
     rounds = max(1, req.max_rounds)  # 由用户设定，不硬限制上限
     job = _mgr.start(
         req.entity_name.strip(),
         hints=req.hints.strip(),
         goal=req.goal.strip(),
         max_rounds=rounds,
+        plan_provider=provider,
     )
-    return {"job_id": job.id, "status": job.status}
+    return {"job_id": job.id, "status": job.status, "plan_provider": provider or "auto"}
 
 
 @app.get("/api/jobs")
@@ -109,6 +115,24 @@ def reject_job(job_id: str):
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     return job.to_dict()
+
+
+# ── 工具注册表 API（P1.1）─────────────────────────────
+
+@app.get("/api/tools")
+def list_tools(category: str = ""):
+    """工具注册表清单（7 爬虫 + 处理步骤，LLM function calling 用）"""
+    from shared.tools.registry import get_registry
+    reg = get_registry()
+    tools = reg.list_tools(category=category or None)
+    return {"tools": tools, "total": len(tools)}
+
+
+@app.get("/api/tools/audit")
+def tool_audit(limit: int = 50):
+    """工具调用审计记录（本次进程内）"""
+    from shared.tools.registry import get_registry
+    return {"records": get_registry().audit(limit=limit)}
 
 
 # ── 知识图谱 API ──────────────────────────────────────

@@ -42,6 +42,7 @@ class InvestigationState(TypedDict):
     hints: str
     goal: str
     max_rounds: int
+    plan_provider: str              # auto/hermes/local（覆盖 config.PLAN_PROVIDER）
 
     # Plan-and-Execute 状态
     plan: list[dict]                # 维度模板 [{name, methodology_source, rationale, queries, priority}]
@@ -144,7 +145,7 @@ def plan_node(state: InvestigationState) -> dict:
     from shared.plan.validator import PlanValidator
 
     provider = PlanProvider(
-        mode=config.PLAN_PROVIDER,
+        mode=state.get("plan_provider") or config.PLAN_PROVIDER,
         validator=PlanValidator(),
         local_generator=_local_plan_generator,
     )
@@ -853,7 +854,7 @@ def get_graph():
 
 def run_investigation(
     entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30,
-    job_id: str = "",
+    job_id: str = "", plan_provider: str = "",
 ) -> tuple[dict, str]:
     """执行调查（多轮深挖）到 review 暂停点。返回 (result_state, thread_id)"""
     thread_id = f"inv_{int(time.time()*1000)}"
@@ -864,6 +865,7 @@ def run_investigation(
         "hints": hints,
         "goal": goal,
         "max_rounds": max_rounds,
+        "plan_provider": plan_provider,   # 空 = 用 config.PLAN_PROVIDER
         "plan": [],             # plan_node 填充
         "plan_index": 0,
         "round": 1,

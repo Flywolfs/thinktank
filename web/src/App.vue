@@ -29,6 +29,14 @@
                 <el-slider v-model="form.max_rounds" :min="1" :max="30" show-stops
                            style="width: 100%" />
               </el-form-item>
+              <el-form-item label="Plan 决策模式">
+                <el-radio-group v-model="form.plan_provider">
+                  <el-radio-button value="auto">auto (Hermes优先)</el-radio-button>
+                  <el-radio-button value="hermes">hermes (Docker)</el-radio-button>
+                  <el-radio-button value="local">local (自研)</el-radio-button>
+                </el-radio-group>
+                <div class="field-hint">auto: Hermes 生成 plan，失败自动降级自研 5 步推理</div>
+              </el-form-item>
               <el-button type="primary" :loading="investigating" @click="startInvestigation">
                 开始调查
               </el-button>
@@ -133,7 +141,7 @@ import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 
 // ── 状态 ──────────────────────────────────────────────
-const form = ref({ entity_name: '', hints: '', goal: '', max_rounds: 30 })
+const form = ref({ entity_name: '', hints: '', goal: '', max_rounds: 30, plan_provider: 'auto' })
 const investigating = ref(false)
 const currentJob = ref(null)
 const jobs = ref([])
@@ -158,6 +166,7 @@ async function startInvestigation() {
       hints: form.value.hints.trim(),
       goal: form.value.goal.trim(),
       max_rounds: form.value.max_rounds,
+      plan_provider: form.value.plan_provider,
     })
     await loadJob(data.job_id)
     // 轮询进度（调查是同步执行的，这里主要等 review 状态）
@@ -344,6 +353,7 @@ onBeforeUnmount(() => {
 .app-header .subtitle { color: #8fa3b8; font-size: 12px; }
 .panel { margin-bottom: 16px; }
 .empty-hint { color: #999; text-align: center; padding: 30px 0; font-size: 13px; }
+.field-hint { color: #999; font-size: 12px; line-height: 1.4; margin-top: 4px; }
 .report-body { font-size: 13px; line-height: 1.7; max-height: 500px; overflow-y: auto; }
 .report-body h2 { font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
 .report-body h3 { font-size: 15px; margin-top: 16px; }
