@@ -102,6 +102,52 @@
               </el-table-column>
             </el-table>
           </el-card>
+
+          <!-- 动态工具（Phase C） -->
+          <el-card shadow="never" class="panel">
+            <template #header><b>🛠️ 动态工具 (Phase C)</b></template>
+            <el-form label-position="top" @submit.prevent="generateDynamicTool">
+              <el-form-item label="需求描述">
+                <el-input v-model="dynForm.requirement" type="textarea" :rows="2"
+                          placeholder="如：抓取某某网站的公司新闻" />
+              </el-form-item>
+              <el-form-item label="审批模式">
+                <el-radio-group v-model="dynForm.approval_mode">
+                  <el-radio-button value="manual">manual (人工)</el-radio-button>
+                  <el-radio-button value="auto">auto (LLM审查)</el-radio-button>
+                </el-radio-group>
+                <div class="field-hint">
+                  auto: LLM 安全审查代码，通过自动注册；发现问题反馈 Hermes 修改（最多 3 轮）
+                </div>
+              </el-form-item>
+              <el-button type="primary" size="small" :loading="generating" @click="generateDynamicTool">
+                生成爬虫
+              </el-button>
+            </el-form>
+
+            <el-divider v-if="dynTools.length">待审批 / 已注册</el-divider>
+            <div v-for="t in dynTools" :key="t.name" class="dyn-tool-row">
+              <div style="flex: 1">
+                <b>{{ t.name }}</b>
+                <el-tag :type="dynStatusType(t.status)" size="small" style="margin-left: 6px">
+                  {{ dynStatusLabel(t.status) }}
+                </el-tag>
+                <el-tag v-if="t.approval_mode === 'auto'" type="info" size="small" style="margin-left: 4px">
+                  auto{{ t.review_rounds ? '·'+t.review_rounds+'轮' : '' }}
+                </el-tag>
+                <div class="field-hint">{{ t.description }}</div>
+                <div v-if="t.error" class="dyn-error">{{ t.error }}</div>
+              </div>
+              <div v-if="t.status === 'pending'" style="white-space: nowrap">
+                <el-button size="small" type="primary" @click="approveDynamicTool(t)">批准</el-button>
+                <el-button size="small" @click="viewDynamicCode(t)">源码</el-button>
+              </div>
+              <div v-else style="white-space: nowrap">
+                <el-button size="small" @click="viewDynamicCode(t)">源码</el-button>
+              </div>
+            </div>
+            <div v-if="!dynTools.length" class="empty-hint">还没有动态工具</div>
+          </el-card>
         </el-col>
 
         <!-- 右侧: 报告 + 图谱 -->
@@ -151,6 +197,11 @@ const graphEntities = ref([])
 const graphEl = ref(null)
 let graphChart = null
 let pollTimer = null
+
+// 动态工具状态
+const dynForm = ref({ requirement: '', approval_mode: 'auto' })
+const dynTools = ref([])
+const generating = ref(false)
 
 // ── 调查操作 ──────────────────────────────────────────
 async function startInvestigation() {
@@ -255,6 +306,70 @@ async function loadJob(jobId) {
   } catch (e) { /* 忽略 */ }
 }
 
+// ── 动态工具 (Phase C) ───────────────────────────────
+async function generateDynamicTool() {
+  if (!dynForm.value.requirement.trim()) {
+    ElMessage.warning('请输入需求描述')
+    return
+  }
+  generating.value = true
+  try {
+    const { data } = await axios.post('/api/tools/dynamic/generate', {
+      requirement: dynForm.value.requirement.trim(),
+      approval_mode: dynForm.value.approval_mode,
+    })
+    ElMessage.success(data.message || '已生成')
+    dynForm.value.requirement = ''
+    loadDynamicTools()
+  } catch (e) {
+    ElMessage.error('生成失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    generating.value = false
+  }
+}
+
+async function loadDynamicTools() {
+  try {
+    const { data } = await axios.get('/api/tools/dynamic')
+    dynTools.value = data.tools || []
+  } catch (e) { /* 忽略 */ }
+}
+
+async function approveDynamicTool(t) {
+  try {
+    const { data } = await axios.post(`/api/tools/dynamic/${t.name}/approve`)
+    ElMessage.success(data.message || '已批准')
+    loadDynamicTools()
+  } catch (e) {
+    ElMessage.error('审批失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+async function viewDynamicCode(t) {
+  try {
+    const { data } = await axios.get(`/api/tools/dynamic/${t.name}`)
+    // 弹出源码查看（简化为 alert 太长，用 ElMessageBox）
+    const { ElMessageBox } = await import('element-plus')
+    ElMessageBox.alert(
+      `<pre style="max-height:400px;overflow:auto;font-size:12px;white-space:pre-wrap">${escapeHtml(data.code)}</pre>`,
+      `源码: ${data.name}`,
+      { dangerouslyUseHTMLString: true, customClass: 'code-dialog' }
+    )
+  } catch (e) {
+    ElMessage.error('获取源码失败')
+  }
+}
+
+function dynStatusLabel(s) {
+  return { pending: '待审批', approved: '已注册', rejected: '已拒绝' }[s] || s
+}
+function dynStatusType(s) {
+  return { pending: 'warning', approved: 'success', rejected: 'info' }[s] || 'info'
+}
+function escapeHtml(s) {
+  return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
 // ── 图谱 ──────────────────────────────────────────────
 async function queryGraph() {
   if (!graphQuery.value.trim()) return
@@ -337,6 +452,7 @@ function renderMarkdown(md) {
 // ── 生命周期 ──────────────────────────────────────────
 onMounted(() => {
   loadJobs()
+  loadDynamicTools()
   window.addEventListener('resize', () => graphChart && graphChart.resize())
 })
 
@@ -354,6 +470,9 @@ onBeforeUnmount(() => {
 .panel { margin-bottom: 16px; }
 .empty-hint { color: #999; text-align: center; padding: 30px 0; font-size: 13px; }
 .field-hint { color: #999; font-size: 12px; line-height: 1.4; margin-top: 4px; }
+.dyn-tool-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #eee; }
+.dyn-error { color: #f56c6c; font-size: 12px; margin-top: 2px; }
+.code-dialog pre { margin: 0; }
 .report-body { font-size: 13px; line-height: 1.7; max-height: 500px; overflow-y: auto; }
 .report-body h2 { font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
 .report-body h3 { font-size: 15px; margin-top: 16px; }

@@ -141,16 +141,30 @@ def tool_audit(limit: int = 50, job_id: str = ""):
 class DynamicToolRequest(BaseModel):
     requirement: str           # 需求描述（如"抓取某某网站的公司新闻"）
     name: str = ""             # 可选，工具名（缺省自动猜）
+    approval_mode: str = ""    # manual(人审) / auto(LLM安全审查) / 空=config默认
+    max_review_rounds: int = 3 # auto 模式最多审查轮数
 
 
 @app.post("/api/tools/dynamic/generate")
 def dynamic_generate(req: DynamicToolRequest):
-    """调用 Docker Hermes 生成新爬虫代码（保存为 pending，待审批）"""
+    """调用 Docker Hermes 生成新爬虫代码。
+    approval_mode=auto: LLM 安全审查 → 通过自动注册；发现问题反馈 Hermes 修改循环
+    approval_mode=manual(默认): 保存 pending 待用户审批"""
     if not req.requirement.strip():
         raise HTTPException(400, "requirement 不能为空")
+    mode = (req.approval_mode or "").strip().lower()
+    if mode and mode not in ("manual", "auto"):
+        raise HTTPException(400, f"approval_mode 非法: {mode}（可选 manual/auto）")
     from shared.tools.dynamic import get_dynamic_manager
     try:
-        tool = get_dynamic_manager().generate(req.requirement.strip(), name=req.name)
+        tool = get_dynamic_manager().generate(
+            req.requirement.strip(), name=req.name,
+            approval_mode=mode, max_review_rounds=req.max_review_rounds,
+        )
+        if tool.status == "approved":
+            return {"name": tool.name, "status": tool.status,
+                    "message": "auto 审批通过，已注册为 dynamic_<name> 工具",
+                    "review_rounds": tool.review_rounds}
         return {"name": tool.name, "status": tool.status, "message": "代码已生成，待审批"}
     except Exception as e:
         raise HTTPException(500, f"动态工具生成失败: {e}")

@@ -83,6 +83,8 @@ class DynamicTool:
     code: str = ""
     created_at: float = field(default_factory=time.time)
     generated_by: str = "hermes"   # hermes / manual
+    approval_mode: str = "manual"  # manual(人审) / auto(LLM 安全审查自动)
+    review_rounds: int = 0         # auto 模式审查轮数
     error: str = ""
 
     def to_dict(self) -> dict:
@@ -93,6 +95,8 @@ class DynamicTool:
             "code": self.code,
             "created_at": self.created_at,
             "generated_by": self.generated_by,
+            "approval_mode": self.approval_mode,
+            "review_rounds": self.review_rounds,
             "error": self.error,
         }
 
@@ -114,26 +118,127 @@ class DynamicToolManager:
 
     # ── 生成（调 Hermes） ──────────────────────────────
 
-    def generate(self, requirement: str, name: str = "") -> DynamicTool:
-        """调用 Docker Hermes 生成爬虫代码，保存为 pending 状态"""
+    def generate(
+        self, requirement: str, name: str = "",
+        approval_mode: str = "",
+        max_review_rounds: int = 3,
+    ) -> DynamicTool:
+        """生成爬虫代码。
+
+        approval_mode:
+          manual (默认) — 保存 pending，等用户审批
+          auto          — LLM 安全审查 → 通过直接注册；发现问题反馈 Hermes 修改（最多 N 轮）
+        """
         from shared.plan.hermes_provider import PlanProviderError
 
+        mode = (approval_mode or config.DYNAMIC_TOOL_APPROVAL or "manual").lower()
+        if mode not in ("manual", "auto"):
+            mode = "manual"
+
         name = self._sanitize_name(name or self._guess_name(requirement))
-        code = self._call_hermes_generate(requirement, name)
+
+        # 首轮生成
+        code = self._call_hermes_generate(requirement, name, feedback="")
         if not code:
             raise PlanProviderError("Hermes 未返回代码")
 
+        if mode == "auto":
+            return self._auto_approve_loop(requirement, name, code, max_review_rounds)
+
         tool = DynamicTool(name=name, description=requirement[:100], code=code)
+        tool.approval_mode = "manual"
         self._save(tool)
         return tool
 
-    def _call_hermes_generate(self, requirement: str, name: str) -> str:
+    def _auto_approve_loop(
+        self, requirement: str, name: str, code: str, max_review_rounds: int,
+    ) -> DynamicTool:
+        """auto 模式：LLM 安全审查 → 通过注册；发现问题反馈 Hermes 修改循环"""
+        from shared.plan.hermes_provider import PlanProviderError
+        from shared.tools.registry import get_registry
+        from shared.tools.security import get_security_reviewer
+        from shared.utils.logger import get_current_logger
+
+        logger = get_current_logger()
+        reviewer = get_security_reviewer()
+
+        tool = DynamicTool(
+            name=name, description=requirement[:100], code=code,
+            status="pending", approval_mode="auto",
+        )
+        self._save(tool)
+
+        for round_no in range(1, max_review_rounds + 1):
+            result = reviewer.review(tool.code, name=name)
+            if result.passed:
+                # 审查通过 → 自动注册
+                tool.status = "approved"
+                tool.error = ""
+                tool.review_rounds = round_no
+                self._save(tool)
+                # 加载注册
+                self._load_and_register(tool, registry=get_registry())
+                if logger:
+                    logger.info(
+                        "dynamic_auto", f"auto 审批通过: {name} (第{round_no}轮审查)",
+                        detail={"name": name, "rounds": round_no},
+                    )
+                return tool
+
+            # 发现问题 → 反馈给 Hermes 修改
+            if logger:
+                logger.info(
+                    "dynamic_auto", f"auto 审查未过: {name} 第{round_no}轮 {len(result.issues)} 个问题",
+                    detail={"issues": result.issues[:3]},
+                )
+            if round_no >= max_review_rounds:
+                # 达到轮次上限 → 转人工审批（保留代码，标记 pending + 附审查意见）
+                tool.error = (
+                    f"auto 审查 {max_review_rounds} 轮未通过，已转人工审批。"
+                    f"问题: {'; '.join(result.issues[:3])}"
+                )
+                self._save(tool)
+                return tool
+
+            # 让 Hermes 修改（feedback 附审查意见）
+            new_code = self._call_hermes_generate(
+                requirement, name, feedback=result.review_log
+            )
+            if not new_code:
+                raise PlanProviderError("Hermes 修改未返回代码")
+            tool.code = new_code
+            self._save(tool)
+
+        return tool
+
+    def _load_and_register(self, tool: DynamicTool, registry=None) -> None:
+        """加载 + health_check + 注册（auto 模式复用）"""
+        from shared.tools.registry import ToolSpec
+
+        provider_cls = self._load_provider(tool)
+        provider = provider_cls()
+        if not provider.health_check():
+            raise RuntimeError(f"health_check 失败: {tool.name}")
+        if registry is not None:
+            registry.register(
+                ToolSpec(
+                    name=f"dynamic_{tool.name}",
+                    description=tool.description,
+                    category="crawler",
+                    cost="medium",
+                    provider=f"dynamic:{tool.name}",
+                ),
+                lambda query, max_results=10: _dynamic_search(provider, query, max_results),
+            )
+
+    def _call_hermes_generate(self, requirement: str, name: str, feedback: str = "") -> str:
         """让 Hermes 用 file 工具直接写代码到 /opt/tools_dynamic/{name}.py，
         框架轮询文件出现后读取。
 
         优势（用户建议）:
         - 无 markdown 后处理：Hermes 写文件的内容就是纯代码，不做字符串清理
         - timeout 不再卡单次请求：HTTP 只负责启动任务，等待用轮询（支持多次迭代改进）
+        feedback 非空 = 上一轮安全审查意见，Hermes 需按意见修改。
         """
         if not config.HERMES_API_KEY:
             raise RuntimeError("HERMES_API_KEY 未配置（deploy/intel-planner/.env）")
@@ -146,12 +251,18 @@ class DynamicToolManager:
         template = TOOL_TEMPLATE.format(
             name=name, description=requirement[:80], class_name=class_name,
         )
+        feedback_block = ""
+        if feedback:
+            feedback_block = (
+                f"\n【安全审查反馈】上一轮代码被安全审查发现以下问题，请修改后重新写入文件:\n"
+                f"{feedback}\n"
+            )
         prompt = f"""你是一个爬虫开发专家。请为情报系统开发一个新的数据源爬虫。
 
 需求: {requirement}
 工具名: {name}
 类名: {class_name}
-
+{feedback_block}
 【重要】请使用你的 file 写入工具，把代码**直接写入文件**:
 路径: /opt/tools_dynamic/{name}.py
 
