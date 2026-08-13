@@ -51,6 +51,7 @@ HERMES_API_URL = get("HERMES_API_URL", "http://localhost:8643")
 HERMES_API_KEY = get("HERMES_API_KEY", "")
 HERMES_PLAN_MODEL = get("HERMES_PLAN_MODEL", "intel-planner")
 HERMES_PLAN_TIMEOUT = int(get("HERMES_PLAN_TIMEOUT", "180"))
+HERMES_POLL_TIMEOUT = float(get("HERMES_POLL_TIMEOUT", "300"))  # 动态工具文件轮询上限
 
 # ── ASR ────────────────────────────────────────────────
 

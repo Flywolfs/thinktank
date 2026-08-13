@@ -84,6 +84,9 @@ curl -s http://localhost:8643/v1/chat/completions \
 ## 常见问题
 
 - **容器起不来 / API 不通**：`docker logs hermes-intel-planner` 看日志
+- **动态工具生成超时**：Hermes 写代码是"写文件 + 框架轮询"模式，
+  单次 HTTP 只负责启动任务（60s 超时），真正等待由轮询承担（默认 300s，可调 HERMES_POLL_TIMEOUT）。
+  如果长时间未生成，检查 `docker exec hermes-intel-planner ls /opt/tools_dynamic/` 看文件是否写入
 - **想改工具集**：`docker exec hermes-intel-planner hermes -p intel-planner tools`（交互式）
 - **重启**：`docker compose restart`
 - **删除**：`docker compose down`（数据保留在 ~/.hermes-intel-planner）

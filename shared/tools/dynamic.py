@@ -128,9 +128,19 @@ class DynamicToolManager:
         return tool
 
     def _call_hermes_generate(self, requirement: str, name: str) -> str:
-        """调 Hermes /v1/chat/completions 生成代码"""
+        """让 Hermes 用 file 工具直接写代码到 /opt/tools_dynamic/{name}.py，
+        框架轮询文件出现后读取。
+
+        优势（用户建议）:
+        - 无 markdown 后处理：Hermes 写文件的内容就是纯代码，不做字符串清理
+        - timeout 不再卡单次请求：HTTP 只负责启动任务，等待用轮询（支持多次迭代改进）
+        """
         if not config.HERMES_API_KEY:
             raise RuntimeError("HERMES_API_KEY 未配置（deploy/intel-planner/.env）")
+
+        # 清掉旧文件（防止读到上一次的结果）
+        out_path = Path(DEFAULT_DYNAMIC_DIR) / f"{name}.py"
+        out_path.unlink(missing_ok=True)
 
         class_name = self._to_class_name(name)
         template = TOOL_TEMPLATE.format(
@@ -141,6 +151,9 @@ class DynamicToolManager:
 需求: {requirement}
 工具名: {name}
 类名: {class_name}
+
+【重要】请使用你的 file 写入工具，把代码**直接写入文件**:
+路径: /opt/tools_dynamic/{name}.py
 
 【必须遵守的代码模板】（保持结构和类名不变，只填充 search() 实现）:
 ```python
@@ -153,30 +166,55 @@ class DynamicToolManager:
 3. 解析后构造 SearchResult 列表，source_type 用 news/social/knowledge/enterprise 之一
 4. health_check() 返回真实可用性判断
 5. 失败时返回空列表，不抛异常
-6. 只输出 Python 代码，不要额外解释，不要 markdown 代码块标记
+6. 写完文件后，回复一句话确认文件已写入 /opt/tools_dynamic/{name}.py
 """
-        resp = httpx.post(
-            f"{config.HERMES_API_URL}/v1/chat/completions",
-            headers={"Content-Type": "application/json",
-                     "Authorization": f"Bearer {config.HERMES_API_KEY}"},
-            json={"model": config.HERMES_PLAN_MODEL,
-                  "messages": [{"role": "user", "content": prompt}],
-                  "temperature": 0.1},
-            timeout=config.HERMES_PLAN_TIMEOUT,
-        )
-        resp.raise_for_status()
-        content = resp.json()["choices"][0]["message"]["content"]
-        # 清理 markdown 代码块标记（```python ... ``` 或 ``` ... ```）
-        if "```" in content:
-            parts = content.split("```")
-            for p in parts:
-                candidate = p.strip()
-                if candidate.startswith("python\n"):
-                    candidate = candidate[len("python\n"):].strip()
-                if "class " in candidate or "def " in candidate:
-                    content = candidate
-                    break
-        return content.strip()
+        # HTTP 只负责"启动任务"——Hermes 开始写文件后即可返回，
+        # 用较短的请求超时（写代码的实际等待由下面的轮询承担）
+        try:
+            resp = httpx.post(
+                f"{config.HERMES_API_URL}/v1/chat/completions",
+                headers={"Content-Type": "application/json",
+                         "Authorization": f"Bearer {config.HERMES_API_KEY}"},
+                json={"model": config.HERMES_PLAN_MODEL,
+                      "messages": [{"role": "user", "content": prompt}],
+                      "temperature": 0.1},
+                timeout=min(config.HERMES_PLAN_TIMEOUT, 60),  # 启动任务，60s 足够
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            # HTTP 失败不一定是真失败——Hermes 可能仍在写文件。
+            # 继续轮询，让文件出现与否做最终判断。
+            pass
+
+        # 轮询文件出现（支持 Hermes 多轮迭代改进，最长 poll_seconds）
+        poll_seconds = self._poll_timeout()
+        code = self._wait_for_file(out_path, timeout=poll_seconds)
+        if not code:
+            raise TimeoutError(
+                f"Hermes 在 {poll_seconds}s 内未写入 {name}.py。"
+                f"可能: 容器 tools_dynamic 挂载不可写 / Hermes 无 file 工具 / 生成超时"
+            )
+        return code
+
+    def _wait_for_file(self, path: Path, timeout: float = 300.0, interval: float = 5.0) -> str:
+        """轮询等待文件出现并返回内容"""
+        import time as _time
+        deadline = _time.time() + timeout
+        while _time.time() < deadline:
+            if path.exists():
+                try:
+                    return path.read_text(encoding="utf-8")
+                except Exception:
+                    pass  # 文件可能正在写入，重试
+            _time.sleep(interval)
+        return ""
+
+    def _poll_timeout(self) -> float:
+        """轮询总时长（独立于 HTTP timeout）——爬虫开发可能多次迭代，默认 5 分钟"""
+        try:
+            return float(config.get("HERMES_POLL_TIMEOUT", "300"))
+        except Exception:
+            return 300.0
 
     # ── 审批 ───────────────────────────────────────────
 
