@@ -15,6 +15,7 @@ import json
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from shared.utils.logger import get_current_logger
@@ -62,14 +63,15 @@ class ToolSpec:
 
 @dataclass
 class ToolCallRecord:
-    """工具调用留痕（P1.3 审计基础）"""
+    """工具调用留痕（P1.3 完整审计）"""
     tool: str
     params: dict
     job_id: str = ""                 # 所属调查任务（回放按 job 过滤）
     ts: float = field(default_factory=time.time)
     duration_s: float = 0.0
     status: str = "ok"           # ok / error
-    summary: str = ""            # 结果摘要（不存全量，避免日志膨胀）
+    summary: str = ""            # 结果摘要（一行的概述）
+    output: list = field(default_factory=list)   # 输出明细（标题/URL 等，回放用）
     error: str = ""
 
     def to_dict(self) -> dict:
@@ -81,17 +83,22 @@ class ToolCallRecord:
             "duration_s": round(self.duration_s, 2),
             "status": self.status,
             "summary": self.summary[:500],
+            "output": self.output[:20],
             "error": self.error[:300],
         }
 
 
 class ToolRegistry:
-    """工具注册表 — 注册/查询/调用/审计"""
+    """工具注册表 — 注册/查询/调用/审计（P1.3 支持磁盘持久化回放）"""
 
-    def __init__(self):
+    def __init__(self, audit_dir: str | Path | None = None):
         self._tools: dict[str, ToolSpec] = {}
         self._handlers: dict[str, Callable] = {}
         self._audit: list[ToolCallRecord] = []
+        self._audit_dir: Path | None = None
+        if audit_dir is not None:
+            self._audit_dir = Path(audit_dir)
+            self._audit_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 注册 ───────────────────────────────────────────
 
@@ -124,7 +131,7 @@ class ToolRegistry:
     # ── 调用（带审计） ─────────────────────────────────
 
     def call(self, name: str, job_id: str = "", **params) -> Any:
-        """调用工具：执行 handler + 记录审计。抛 ToolNotFoundError / 透传 handler 异常"""
+        """调用工具：执行 handler + 记录审计（内存 + 磁盘持久化）。抛 ToolNotFoundError / 透传 handler 异常"""
         if name not in self._handlers:
             raise ToolNotFoundError(f"工具未注册: {name}")
 
@@ -138,6 +145,7 @@ class ToolRegistry:
             result = handler(**params)
             record.duration_s = time.time() - t0
             record.summary = self._summarize(result)
+            record.output = self._extract_output(result)
             record.status = "ok"
             if logger:
                 logger.info(
@@ -157,12 +165,16 @@ class ToolRegistry:
             raise
         finally:
             self._audit.append(record)
+            self._persist(record)
 
     # ── 审计 ───────────────────────────────────────────
 
     def audit(self, limit: int = 50, job_id: str = "") -> list[dict]:
-        """工具调用记录（回放用）。job_id 非空时只返回该任务的记录"""
+        """工具调用记录（完整回放）。优先读磁盘（跨进程/重启后仍可回放），
+        磁盘缺失时回退内存。job_id 非空时只返回该任务的记录。"""
         records = self._audit
+        if self._audit_dir is not None and job_id:
+            records = self._load_from_disk(job_id)
         if job_id:
             records = [r for r in records if r.job_id == job_id]
         return [r.to_dict() for r in records[-limit:]]
@@ -172,8 +184,34 @@ class ToolRegistry:
 
     # ── 内部 ───────────────────────────────────────────
 
+    def _persist(self, record: ToolCallRecord) -> None:
+        """把记录追加写入 data/audit/{job_id}.jsonl"""
+        if self._audit_dir is None or not record.job_id:
+            return
+        try:
+            path = self._audit_dir / f"{record.job_id}.jsonl"
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        except Exception:
+            pass  # 审计落盘失败不阻塞工具调用
+
+    def _load_from_disk(self, job_id: str) -> list:
+        """从磁盘读该 job 的审计记录（回放）"""
+        assert self._audit_dir is not None
+        path = self._audit_dir / f"{job_id}.jsonl"
+        if not path.exists():
+            return []
+        try:
+            out = []
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    out.append(ToolCallRecord(**json.loads(line)))
+            return out
+        except Exception:
+            return []
+
     def _summarize(self, result: Any) -> str:
-        """结果摘要（避免审计日志存全量数据）"""
+        """结果摘要（一行的概述）"""
         try:
             if hasattr(result, "total_results"):
                 return f"{result.total_results} 条结果"
@@ -187,6 +225,36 @@ class ToolRegistry:
         except Exception:
             return ""
 
+    def _extract_output(self, result: Any) -> list:
+        """提取输出明细（标题/URL 等，供回放查看"每个工具返回什么"）"""
+        try:
+            # EntityReport：web/social/knowledge 结果标题+URL
+            if hasattr(result, "web_results") or hasattr(result, "social_results"):
+                items = []
+                for r in list(getattr(result, "web_results", []))[:6] + \
+                         list(getattr(result, "social_results", []))[:6] + \
+                         list(getattr(result, "knowledge_results", []))[:6]:
+                    items.append({"title": (r.title or "")[:80], "url": (r.url or "")[:120]})
+                return items
+            # list[SearchResult] 或普通 list
+            if isinstance(result, (list, tuple)):
+                items = []
+                for r in result[:6]:
+                    if hasattr(r, "title"):
+                        items.append({"title": (r.title or "")[:80], "url": (r.url or "")[:120]})
+                    else:
+                        items.append({"item": str(r)[:120]})
+                return items
+            # dict（如 graph_build 返回统计）
+            if isinstance(result, dict):
+                return [{k: str(v)[:100]} for k, v in list(result.items())[:6]]
+            # AnalysisReport / 其他对象
+            if hasattr(result, "key_findings"):
+                return [{"finding": str(f)[:150]} for f in result.key_findings[:6]]
+            return []
+        except Exception:
+            return []
+
 
 class ToolNotFoundError(Exception):
     pass
@@ -198,16 +266,21 @@ _default_registry: ToolRegistry | None = None
 
 
 def get_registry() -> ToolRegistry:
-    """获取全局 Tool Registry（惰性构建，避免导入时初始化外部依赖）"""
+    """获取全局 Tool Registry（惰性构建，避免导入时初始化外部依赖）。
+    P1.3: 默认启用 data/audit/ 磁盘持久化（跨进程可回放）"""
     global _default_registry
     if _default_registry is None:
-        _default_registry = build_default_registry()
+        from shared.utils import config
+        _project_root = Path(__file__).resolve().parent.parent.parent
+        _default_registry = build_default_registry(
+            audit_dir=_project_root / "data" / "audit"
+        )
     return _default_registry
 
 
-def build_default_registry() -> ToolRegistry:
+def build_default_registry(audit_dir: str | Path | None = None) -> ToolRegistry:
     """构建默认工具集：7 个爬虫 Provider + 处理步骤 + 图执行级聚合工具"""
-    reg = ToolRegistry()
+    reg = ToolRegistry(audit_dir=audit_dir)
     _register_crawlers(reg)
     _register_processors(reg)
     _register_graph_tools(reg)

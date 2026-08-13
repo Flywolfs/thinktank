@@ -129,10 +129,11 @@ def list_tools(category: str = ""):
 
 
 @app.get("/api/tools/audit")
-def tool_audit(limit: int = 50):
-    """工具调用审计记录（本次进程内）"""
+def tool_audit(limit: int = 50, job_id: str = ""):
+    """工具调用审计（P1.3 完整回放：输入/输出/耗时/参数）。
+    job_id 指定时读磁盘 data/audit/{job_id}.jsonl（跨进程/重启后仍可回放）"""
     from shared.tools.registry import get_registry
-    return {"records": get_registry().audit(limit=limit)}
+    return {"records": get_registry().audit(limit=limit, job_id=job_id), "job_id": job_id}
 
 
 # ── 知识图谱 API ──────────────────────────────────────
