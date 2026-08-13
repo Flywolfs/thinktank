@@ -21,7 +21,10 @@ from typing import TypedDict
 
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command, Send, interrupt
+
+from typing import Annotated
+from operator import add
 
 from shared.models.analysis_report import AnalysisReport
 from shared.models.entity_report import EntityReport
@@ -55,6 +58,10 @@ class InvestigationState(TypedDict):
     leads: list[dict]               # 线索队列（Lead.to_dict()）
     all_rounds: list[dict]          # 每轮结果摘要
     asr_count: int                  # 已转录视频数（成本控制）
+
+    # P2.2 线索并行状态
+    parallel_leads: Annotated[list[dict], add]  # 本轮并行深挖的线索（Send 分发）
+    parallel_results: Annotated[list[dict], add]  # 各线索搜索结果（合并用）
 
     # 当前轮结果（report 跨轮累积）
     report: EntityReport
@@ -622,7 +629,7 @@ def deep_audio_node(state: InvestigationState) -> dict:
 
 
 def analyze_leads_node(state: InvestigationState) -> dict:
-    """执行控制：按维度模板轮转，判断是否进入下一维度/完成"""
+    """执行控制：维护线索队列 + 判断是否并行深挖线索 / 进入下一维度 / 完成"""
     logger = _get_logger(state)
     report = state["report"]
     plan = state.get("plan", [])
@@ -704,6 +711,150 @@ def analyze_leads_node(state: InvestigationState) -> dict:
     return result
 
 
+# ── P2.2 线索并行 ─────────────────────────────────────
+
+MAX_PARALLEL_LEADS = 3  # 每轮最多并行深挖的线索数（防止资源过载）
+
+
+def route_after_analyze(state: InvestigationState) -> list[Send] | str:
+    """analyze_leads 后路由：有 high 线索未追 → Send 并行深挖；否则按原逻辑"""
+    leads = state.get("leads", [])
+    candidates = [
+        l for l in leads
+        if not l.get("searched") and l.get("priority") == "high"
+        and l.get("name") and l.get("name") not in state.get("visited", [])
+    ][:MAX_PARALLEL_LEADS]
+
+    if candidates and len(leads) >= 3:  # 线索足够多才值得并行
+        return [
+            Send("lead_search", {
+                "entity_name": state["entity_name"],
+                "hints": state.get("hints", ""),
+                "goal": state.get("goal", ""),
+                "job_id": state.get("job_id", ""),
+                "lead_name": c["name"],
+                "lead_relation": c.get("relation", ""),
+            })
+            for c in candidates
+        ]
+
+    # 无并行线索 → 原逻辑：维度未完继续搜索，否则 synthesize
+    if state.get("decision") == "continue":
+        return "search"
+    return "synthesize"
+
+
+def lead_search_node(state: InvestigationState) -> dict:
+    """并行深挖单条线索：对该线索名做快速搜索，结果进 parallel_results"""
+    from shared.tools.registry import get_registry
+
+    logger = _get_logger(state)
+    t0 = time.time()
+    lead_name = state.get("lead_name", "")
+    if not lead_name:
+        return {}
+
+    logger.node_start("lead_search", {"lead": lead_name})
+    reg = get_registry()
+    try:
+        r = reg.call("search_all_fast", job_id=state.get("job_id", ""),
+                     query=lead_name, max_per_source=8)
+        results = []
+        for item in (r.web_results + r.social_results + r.knowledge_results):
+            results.append({
+                "url": item.url,
+                "title": item.title,
+                "content": (item.content or "")[:500],
+                "source": item.source,
+                "source_type": item.source_type,
+                "author": item.author,
+            })
+        logger.node_end("lead_search", {"lead": lead_name, "results": len(results)},
+                        duration_ms=(time.time() - t0) * 1000)
+        return {
+            "parallel_results": [{
+                "lead": lead_name,
+                "relation": state.get("lead_relation", ""),
+                "results": results,
+                "total": len(results),
+            }],
+        }
+    except Exception as e:
+        logger.node_end("lead_search", {"lead": lead_name, "error": str(e)[:100]},
+                        duration_ms=(time.time() - t0) * 1000)
+        return {
+            "parallel_results": [{
+                "lead": lead_name,
+                "relation": state.get("lead_relation", ""),
+                "results": [],
+                "total": 0,
+                "error": str(e)[:100],
+            }],
+        }
+
+
+def merge_parallel_node(state: InvestigationState) -> dict:
+    """合并并行深挖结果到 report（按 URL 去重）+ 标记线索已追"""
+    logger = _get_logger(state)
+    report = state["report"]
+    results = state.get("parallel_results", [])
+
+    # 合并到 report（统一去重）
+    seen = {r.url for r in report.web_results + report.social_results + report.knowledge_results}
+    added = 0
+    lead_names = set()
+    for pr in results:
+        lead = pr.get("lead", "")
+        if lead:
+            lead_names.add(lead)
+        for item in pr.get("results", []):
+            url = item.get("url", "")
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            from shared.crawlers.base import SearchResult
+            report.web_results.append(SearchResult(
+                source=item.get("source", "parallel"),
+                source_type=item.get("source_type", "web"),
+                url=url,
+                title=item.get("title", ""),
+                content=item.get("content", ""),
+                author=item.get("author", ""),
+            ))
+            added += 1
+
+    # 标记这些线索已追
+    leads = []
+    for l in state.get("leads", []):
+        if l.get("name") in lead_names:
+            l["searched"] = True
+        leads.append(l)
+
+    # visited 加入线索名（防环路）
+    visited = list(state.get("visited", []))
+    for n in lead_names:
+        if n not in visited:
+            visited.append(n)
+
+    report.total_results = len(
+        report.web_results + report.social_results + report.knowledge_results
+    )
+    logger.info("merge_parallel", f"并行深挖合并 {added} 条新结果",
+                detail={"leads": sorted(lead_names), "added": added})
+
+    # 本轮并行结束后：回到 analyze_leads 决定下一步（继续维度/收敛）
+    return {
+        "report": report,
+        "leads": leads,
+        "visited": visited,
+        "decision": "continue",  # 让路由重新判断（此时 parallel_results 已累积）
+        "progress": _add_progress(
+            state, "merge_parallel",
+            f"线索并行深挖完成: {len(lead_names)} 线索 / 新增 {added} 条结果",
+        ),
+    }
+
+
 def synthesize_node(state: InvestigationState) -> dict:
     """信息整合推理 → 最终分析报告（走 Tool Registry，留痕）"""
     from shared.tools.registry import get_registry
@@ -770,10 +921,6 @@ def graph_build_node(state: InvestigationState) -> dict:
 
 # ── 路由 ──────────────────────────────────────────────
 
-def route_after_analyze(state: InvestigationState) -> str:
-    return "search" if state.get("decision") == "continue" else "synthesize"
-
-
 def route_after_review(state: InvestigationState) -> str:
     return "graph_build" if state.get("decision") == "approve" else END
 
@@ -812,6 +959,8 @@ def get_graph():
         builder.add_node("extract", extract_node)
         builder.add_node("deep_audio", deep_audio_node)
         builder.add_node("analyze_leads", analyze_leads_node)
+        builder.add_node("lead_search", lead_search_node)
+        builder.add_node("merge_parallel", merge_parallel_node)
         builder.add_node("synthesize", synthesize_node)
         builder.add_node("review", review_node)
         builder.add_node("graph_build", graph_build_node)
@@ -824,8 +973,15 @@ def get_graph():
         builder.add_edge("deep_audio", "analyze_leads")
         builder.add_conditional_edges(
             "analyze_leads", route_after_analyze,
-            {"search": "search", "synthesize": "synthesize"},
+            {
+                "search": "search",
+                "synthesize": "synthesize",
+                "lead_search": "lead_search",
+            },
         )
+        # Send 并行分支：lead_search 各分支 → merge_parallel（合并）→ 回 analyze_leads
+        builder.add_edge("lead_search", "merge_parallel")
+        builder.add_edge("merge_parallel", "analyze_leads")
         builder.add_edge("synthesize", "review")
         builder.add_conditional_edges(
             "review", route_after_review,
@@ -861,6 +1017,8 @@ def run_investigation(
         "leads": [],
         "all_rounds": [],
         "asr_count": 0,
+        "parallel_leads": [],
+        "parallel_results": [],
         "report": EntityReport(entity_name=entity_name),
         "analysis": AnalysisReport(entity_name=entity_name),
         "progress": [],
