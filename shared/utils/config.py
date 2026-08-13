@@ -53,8 +53,8 @@ HERMES_PLAN_MODEL = get("HERMES_PLAN_MODEL", "intel-planner")
 HERMES_PLAN_TIMEOUT = int(get("HERMES_PLAN_TIMEOUT", "180"))
 HERMES_POLL_TIMEOUT = float(get("HERMES_POLL_TIMEOUT", "300"))  # 动态工具文件轮询上限
 
-# 动态工具审批模式: manual(默认,人审) / auto(LLM安全审查自动通过,发现问题反馈Hermes修改)
-DYNAMIC_TOOL_APPROVAL = get("DYNAMIC_TOOL_APPROVAL", "manual")
+# 动态工具审批模式: auto(默认,LLM安全审查自动通过,发现问题反馈Hermes修改) / manual(人工审阅)
+DYNAMIC_TOOL_APPROVAL = get("DYNAMIC_TOOL_APPROVAL", "auto")
 
 # ── ASR ────────────────────────────────────────────────
 
