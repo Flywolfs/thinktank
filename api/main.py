@@ -136,6 +136,70 @@ def tool_audit(limit: int = 50, job_id: str = ""):
     return {"records": get_registry().audit(limit=limit, job_id=job_id), "job_id": job_id}
 
 
+# ── 动态工具 API（P2.1 Phase C）────────────────────────
+
+class DynamicToolRequest(BaseModel):
+    requirement: str           # 需求描述（如"抓取某某网站的公司新闻"）
+    name: str = ""             # 可选，工具名（缺省自动猜）
+
+
+@app.post("/api/tools/dynamic/generate")
+def dynamic_generate(req: DynamicToolRequest):
+    """调用 Docker Hermes 生成新爬虫代码（保存为 pending，待审批）"""
+    if not req.requirement.strip():
+        raise HTTPException(400, "requirement 不能为空")
+    from shared.tools.dynamic import get_dynamic_manager
+    try:
+        tool = get_dynamic_manager().generate(req.requirement.strip(), name=req.name)
+        return {"name": tool.name, "status": tool.status, "message": "代码已生成，待审批"}
+    except Exception as e:
+        raise HTTPException(500, f"动态工具生成失败: {e}")
+
+
+@app.get("/api/tools/dynamic")
+def dynamic_list(status: str = ""):
+    """动态工具列表（status: pending/approved/rejected）"""
+    from shared.tools.dynamic import get_dynamic_manager
+    return {"tools": get_dynamic_manager().list(status=status)}
+
+
+@app.get("/api/tools/dynamic/{name}")
+def dynamic_get(name: str):
+    """查看动态工具详情（含源码，审批前审阅用）"""
+    from shared.tools.dynamic import get_dynamic_manager
+    tool = get_dynamic_manager().get(name)
+    if not tool:
+        raise HTTPException(404, f"动态工具不存在: {name}")
+    return tool.to_dict()
+
+
+@app.post("/api/tools/dynamic/{name}/approve")
+def dynamic_approve(name: str):
+    """审批通过：加载代码 + health_check + 注册进 Tool Registry"""
+    from shared.tools.dynamic import get_dynamic_manager
+    from shared.tools.registry import get_registry
+    try:
+        tool = get_dynamic_manager().approve(name, registry=get_registry())
+        return {"name": tool.name, "status": tool.status, "message": "已注册为 dynamic_<name> 工具"}
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"审批失败: {e}")
+
+
+@app.post("/api/tools/dynamic/{name}/reject")
+def dynamic_reject(name: str, reason: str = ""):
+    """拒绝：标记 rejected，不加载执行"""
+    from shared.tools.dynamic import get_dynamic_manager
+    try:
+        tool = get_dynamic_manager().reject(name, reason)
+        return {"name": tool.name, "status": tool.status, "message": "已拒绝"}
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+
+
 # ── 知识图谱 API ──────────────────────────────────────
 
 @app.get("/api/graph/{name}")

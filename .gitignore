@@ -16,6 +16,9 @@ config.yaml
 # Runtime data
 data/
 
+# 动态工具（Hermes 生成、用户审批后的运行时产物）
+tools/dynamic/
+
 # Node
 node_modules/
 web/node_modules/
