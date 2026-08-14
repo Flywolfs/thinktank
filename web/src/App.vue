@@ -166,8 +166,32 @@
           </el-card>
         </el-col>
 
-        <!-- 右侧: 报告 + 图谱 -->
+        <!-- 右侧: 计划 + 报告 + 图谱 -->
         <el-col :span="14">
+          <!-- 调查计划（P4.1 可视化） -->
+          <el-card shadow="never" class="panel" v-if="currentJob && currentJob.plan && currentJob.plan.length">
+            <template #header>
+              <b>🗺️ 调查计划</b>
+              <el-tag size="small" style="float:right" type="info">
+                {{ currentJob.plan.length }} 个维度
+              </el-tag>
+            </template>
+            <el-timeline>
+              <el-timeline-item v-for="(dim, i) in currentJob.plan" :key="i"
+                                :type="dim.priority === 'high' ? 'primary' : (dim.priority === 'medium' ? 'warning' : 'info')">
+                <b>{{ i + 1 }}. {{ dim.name }}</b>
+                <el-tag size="small" :type="dim.priority === 'high' ? 'danger' : (dim.priority === 'medium' ? 'warning' : 'info')"
+                        style="margin-left: 6px">{{ dim.priority }}</el-tag>
+                <div class="field-hint">{{ dim.methodology_source || '' }}</div>
+                <div class="field-hint" v-if="dim.rationale">{{ dim.rationale }}</div>
+                <div v-if="dim.queries && dim.queries.length" style="margin-top: 4px">
+                  <el-tag v-for="(q, qi) in dim.queries" :key="qi" size="small" type="info"
+                          effect="plain" style="margin-right: 4px">{{ q }}</el-tag>
+                </div>
+              </el-timeline-item>
+            </el-timeline>
+          </el-card>
+
           <!-- 报告区 -->
           <el-card shadow="never" class="panel">
             <template #header><b>📄 分析报告</b></template>
@@ -177,17 +201,48 @@
             <div v-else class="report-body" v-html="renderMarkdown(reportMarkdown)"></div>
           </el-card>
 
+          <!-- 日志查看器（P4.1） -->
+          <el-card shadow="never" class="panel" v-if="currentJob && currentJob.id">
+            <template #header>
+              <b>📜 调查日志</b>
+              <el-button size="small" style="float:right" @click="loadLogs">刷新</el-button>
+              <el-radio-group v-model="logLevel" size="small" style="float:right; margin-right: 8px">
+                <el-radio-button value="">全部</el-radio-button>
+                <el-radio-button value="info">info</el-radio-button>
+                <el-radio-button value="debug">debug</el-radio-button>
+              </el-radio-group>
+            </template>
+            <div v-if="!logs.length" class="empty-hint">暂无日志</div>
+            <div v-else class="log-list">
+              <div v-for="(log, i) in logs" :key="i" class="log-row" :class="'log-' + (log.level || 'info')">
+                <span class="log-time">{{ formatTime(log.ts) }}</span>
+                <el-tag size="small" :type="log.level === 'error' ? 'danger' : (log.level === 'debug' ? 'info' : 'primary')"
+                        style="margin-right: 4px">{{ log.level || 'info' }}</el-tag>
+                <b>{{ log.event }}</b>
+                <span class="field-hint" v-if="log.node"> [{{ log.node }}]</span>
+                <div class="log-detail" v-if="log.detail">{{ shortDetail(log.detail) }}</div>
+                <div class="log-code" v-if="log.code">{{ log.code.file }}:{{ log.code.line }}:{{ log.code.func }}</div>
+              </div>
+            </div>
+          </el-card>
+
           <!-- 图谱区 -->
           <el-card shadow="never" class="panel">
             <template #header>
               <b>🕸️ 知识图谱</b>
-              <el-input v-model="graphQuery" placeholder="查询实体" size="small" style="width: 200px; float: right"
+              <el-input v-model="graphQuery" placeholder="查询实体" size="small" style="width: 160px; float: right"
                         @keyup.enter="queryGraph" />
+              <el-select v-model="graphDepth" size="small" style="width: 80px; float: right; margin-right: 8px"
+                         @change="queryGraph">
+                <el-option :value="1" label="1跳" />
+                <el-option :value="2" label="2跳" />
+                <el-option :value="3" label="3跳" />
+              </el-select>
               <el-button size="small" style="float: right; margin-right: 8px" @click="queryGraph">查询</el-button>
             </template>
             <div ref="graphEl" class="graph-canvas"></div>
             <div v-if="!graphEntities.length" class="empty-hint">
-              输入实体名查询知识图谱（Neo4j）
+              输入实体名查询知识图谱（Neo4j），可调跳数展开
             </div>
           </el-card>
         </el-col>
@@ -211,6 +266,9 @@ const reportMarkdown = ref('')
 const graphQuery = ref('')
 const graphEntities = ref([])
 const graphEl = ref(null)
+const graphDepth = ref(1)
+const logs = ref([])
+const logLevel = ref('')
 let graphChart = null
 let pollTimer = null
 
@@ -255,6 +313,7 @@ function startPolling(jobId) {
     try {
       const { data } = await axios.get(`/api/jobs/${jobId}`)
       currentJob.value = data
+      if (data.id && data.status !== 'error') loadLogs()
       if (data.status === 'review' && data.report) {
         reportMarkdown.value = data.report_markdown
         stopPolling()
@@ -366,7 +425,28 @@ async function loadJob(jobId) {
     const { data } = await axios.get(`/api/jobs/${jobId}`)
     currentJob.value = data
     if (data.report) reportMarkdown.value = data.report_markdown
+    if (data.id) loadLogs()
   } catch (e) { /* 忽略 */ }
+}
+
+// ── P4.1 日志查看器 ───────────────────────────────────
+async function loadLogs() {
+  if (!currentJob.value?.id) return
+  try {
+    const { data } = await axios.get(`/api/jobs/${currentJob.value.id}/logs`, {
+      params: { limit: 200, level: logLevel.value },
+    })
+    logs.value = data.records || []
+  } catch (e) { /* 日志可能不存在 */ }
+}
+
+function shortDetail(detail) {
+  if (!detail) return ''
+  if (typeof detail === 'string') return detail.length > 120 ? detail.slice(0, 120) + '…' : detail
+  try {
+    const s = JSON.stringify(detail)
+    return s.length > 150 ? s.slice(0, 150) + '…' : s
+  } catch (e) { return String(detail) }
 }
 
 // ── 动态工具 (Phase C) ───────────────────────────────
@@ -434,18 +514,21 @@ function escapeHtml(s) {
 }
 
 // ── 图谱 ──────────────────────────────────────────────
-async function queryGraph() {
-  if (!graphQuery.value.trim()) return
+async function queryGraph(name) {
+  const q = name || graphQuery.value
+  if (!q?.trim()) return
+  if (name) graphQuery.value = name
   try {
-    const { data } = await axios.get(`/api/graph/subgraph/${encodeURIComponent(graphQuery.value.trim())}`)
+    const { data } = await axios.get(`/api/graph/subgraph/${encodeURIComponent(q.trim())}`,
+      { params: { depth: graphDepth.value } })
     graphEntities.value = data.entities || []
-    renderGraph(data.entities || [])
+    renderGraph(data.entities || [], q.trim())
   } catch (e) {
     ElMessage.error('图谱查询失败')
   }
 }
 
-function renderGraph(entities) {
+function renderGraph(entities, centerName) {
   if (!graphChart && graphEl.value) {
     graphChart = echarts.init(graphEl.value)
   }
@@ -455,7 +538,7 @@ function renderGraph(entities) {
     id: e.name,
     name: e.name,
     category: e.type || 'entity',
-    symbolSize: 30,
+    symbolSize: e.name === centerName ? 40 : 30,
   }))
   const links = []
   for (const e of entities) {
@@ -480,7 +563,16 @@ function renderGraph(entities) {
       categories: [...new Set(nodes.map(n => n.category))].map(c => ({ name: c })),
       label: { show: true, fontSize: 10 },
       force: { repulsion: 200, edgeLength: 80 },
+      // P4.1: 点击节点展开该实体子图
+      emphasis: { focus: 'adjacency' },
     }],
+  })
+  // 节点点击 → 展开
+  graphChart.off('click')
+  graphChart.on('click', params => {
+    if (params.dataType === 'node' && params.data.name !== centerName) {
+      queryGraph(params.data.name)
+    }
   })
 }
 
@@ -536,6 +628,14 @@ onBeforeUnmount(() => {
 .dyn-tool-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px dashed #eee; }
 .dyn-error { color: #f56c6c; font-size: 12px; margin-top: 2px; }
 .code-dialog pre { margin: 0; }
+.log-list { max-height: 320px; overflow-y: auto; font-size: 12px; }
+.log-row { padding: 4px 6px; border-bottom: 1px solid #f5f7fa; line-height: 1.5; }
+.log-row:hover { background: #fafafa; }
+.log-time { color: #999; margin-right: 6px; font-family: monospace; }
+.log-detail { color: #555; word-break: break-all; margin-top: 2px; }
+.log-code { color: #b0b3b8; font-family: monospace; font-size: 11px; margin-top: 2px; }
+.log-error .log-detail { color: #f56c6c; }
+.log-debug .log-detail { color: #999; }
 .report-body { font-size: 13px; line-height: 1.7; max-height: 500px; overflow-y: auto; }
 .report-body h2 { font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
 .report-body h3 { font-size: 15px; margin-top: 16px; }

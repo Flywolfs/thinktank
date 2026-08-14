@@ -16,6 +16,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+import json
+
 from entity_intel.investigation import InvestigationManager
 from shared.storage.neo4j_client import Neo4jClient
 
@@ -98,6 +100,29 @@ def get_report(job_id: str):
         "report": job.report,
         "report_markdown": job.report_markdown,
     }
+
+
+@app.get("/api/jobs/{job_id}/logs")
+def get_logs(job_id: str, limit: int = 200, level: str = ""):
+    """P4.1: 调查日志查看器 — 读 data/logs/investigation_{job_id}.jsonl
+
+    level: info/debug 过滤（默认全部）"""
+    from pathlib import Path
+    log_file = Path(__file__).resolve().parent.parent / "data" / "logs" / f"investigation_{job_id}.jsonl"
+    if not log_file.exists():
+        raise HTTPException(404, f"日志不存在: {job_id}")
+    records = []
+    for line in log_file.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rec = json.loads(line)
+        except Exception:
+            continue
+        if level and rec.get("level") != level:
+            continue
+        records.append(rec)
+    return {"job_id": job_id, "total": len(records), "records": records[-limit:]}
 
 
 @app.post("/api/jobs/{job_id}/approve")
