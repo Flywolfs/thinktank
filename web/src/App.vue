@@ -37,6 +37,10 @@
                 </el-radio-group>
                 <div class="field-hint">auto: Hermes 生成 plan，失败自动降级自研 5 步推理</div>
               </el-form-item>
+              <el-form-item label="中途可调整方向">
+                <el-switch v-model="form.adjustable" active-text="是" inactive-text="否" />
+                <div class="field-hint">开启后每轮暂停，可输入指令调整调查方向（如"专注资金链"）</div>
+              </el-form-item>
               <el-button type="primary" :loading="investigating" @click="startInvestigation">
                 开始调查
               </el-button>
@@ -84,6 +88,18 @@
               <el-divider>报告已就绪</el-divider>
               <el-button type="success" @click="approveJob">✅ 批准，构建知识图谱</el-button>
               <el-button type="info" @click="rejectJob">🗑️ 丢弃</el-button>
+            </template>
+
+            <!-- P2.3 中途调整方向 -->
+            <template v-if="currentJob.status === 'running' && currentJob.adjustable">
+              <el-divider>🔀 调整调查方向</el-divider>
+              <el-input v-model="adjustInstruction" type="textarea" :rows="2"
+                        placeholder="如：别追争议了，专注资金链" />
+              <div style="margin-top: 8px">
+                <el-button type="warning" size="small" @click="adjustJob">调整方向</el-button>
+                <el-button size="small" @click="continueJob">继续（不调整）</el-button>
+                <el-button type="danger" size="small" @click="stopJob">停止</el-button>
+              </div>
             </template>
           </el-card>
 
@@ -187,7 +203,7 @@ import { ElMessage } from 'element-plus'
 import * as echarts from 'echarts'
 
 // ── 状态 ──────────────────────────────────────────────
-const form = ref({ entity_name: '', hints: '', goal: '', max_rounds: 30, plan_provider: 'auto' })
+const form = ref({ entity_name: '', hints: '', goal: '', max_rounds: 30, plan_provider: 'auto', adjustable: false })
 const investigating = ref(false)
 const currentJob = ref(null)
 const jobs = ref([])
@@ -197,6 +213,9 @@ const graphEntities = ref([])
 const graphEl = ref(null)
 let graphChart = null
 let pollTimer = null
+
+// P2.3 调整方向
+const adjustInstruction = ref('')
 
 // 动态工具状态
 const dynForm = ref({ requirement: '', approval_mode: 'auto' })
@@ -218,6 +237,7 @@ async function startInvestigation() {
       goal: form.value.goal.trim(),
       max_rounds: form.value.max_rounds,
       plan_provider: form.value.plan_provider,
+      adjustable: form.value.adjustable,
     })
     await loadJob(data.job_id)
     // 轮询进度（调查是同步执行的，这里主要等 review 状态）
@@ -275,6 +295,49 @@ async function rejectJob() {
     ElMessage.info('已丢弃')
   } catch (e) {
     ElMessage.error('操作失败')
+  }
+}
+
+// ── P2.3 中途调整方向 ─────────────────────────────────
+async function adjustJob() {
+  if (!currentJob.value) return
+  if (!adjustInstruction.value.trim()) {
+    ElMessage.warning('请输入调整指令')
+    return
+  }
+  try {
+    const { data } = await axios.post(`/api/jobs/${currentJob.value.id}/adjust`, {
+      instruction: adjustInstruction.value.trim(),
+    })
+    currentJob.value = data
+    adjustInstruction.value = ''
+    ElMessage.success('已调整方向')
+    startPolling(data.id)
+  } catch (e) {
+    ElMessage.error('调整失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+async function continueJob() {
+  if (!currentJob.value) return
+  try {
+    const { data } = await axios.post(`/api/jobs/${currentJob.value.id}/continue`)
+    currentJob.value = data
+    ElMessage.info('继续调查')
+    startPolling(data.id)
+  } catch (e) {
+    ElMessage.error('操作失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+async function stopJob() {
+  if (!currentJob.value) return
+  try {
+    const { data } = await axios.post(`/api/jobs/${currentJob.value.id}/stop`)
+    currentJob.value = data
+    ElMessage.info('已停止')
+  } catch (e) {
+    ElMessage.error('操作失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 

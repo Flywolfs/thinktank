@@ -25,6 +25,7 @@ class InvestigationJob:
     hints: str = ""
     goal: str = ""
     plan_provider: str = ""             # auto/hermes/local（空=config 默认）
+    adjustable: bool = False            # P2.3: 每轮可调整方向
     status: str = "pending"           # pending/running/review/approved/rejected/error
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -49,6 +50,7 @@ class InvestigationJob:
             "hints": self.hints,
             "goal": self.goal,
             "plan_provider": self.plan_provider,
+            "adjustable": self.adjustable,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -116,14 +118,18 @@ class InvestigationManager:
 
     def start(
         self, entity_name: str, hints: str = "", goal: str = "",
-        max_rounds: int = 30, plan_provider: str = "",
+        max_rounds: int = 30, plan_provider: str = "", adjustable: bool = False,
     ) -> InvestigationJob:
-        """启动一次调查（多轮深挖），执行到 review 暂停点"""
+        """启动一次调查（多轮深挖），执行到 review 暂停点。
+
+        adjustable=True 时每轮 analyze_leads interrupt，用户可中途调整方向（P2.3）。
+        """
         job = InvestigationJob(
             entity_name=entity_name,
             hints=hints,
             goal=goal,
             plan_provider=plan_provider,
+            adjustable=adjustable,
             status="running",
         )
         job.add_progress("start", f"开始调查实体: {entity_name} (最多 {max_rounds} 轮深挖)")
@@ -134,7 +140,7 @@ class InvestigationManager:
 
             result, thread_id = run_investigation(
                 entity_name, hints=hints, goal=goal, max_rounds=max_rounds,
-                job_id=job.id, plan_provider=plan_provider,
+                job_id=job.id, plan_provider=plan_provider, adjustable=adjustable,
             )
 
             # 从图状态同步结果
@@ -196,6 +202,88 @@ class InvestigationManager:
             pass  # reject 失败不阻塞状态更新
         job.status = "rejected"
         job.add_progress("reject", "用户丢弃本次调查")
+        self.store.save(job)
+        return job
+
+    def adjust_direction(self, job_id: str, instruction: str) -> InvestigationJob:
+        """P2.3: 用户中途调整调查方向（analyze_leads interrupt 暂停点）
+
+        instruction 自然语言指令，如"别追争议了，专注资金链"。
+        """
+        job = self._require(job_id)
+        if job.status != "running":
+            job.error = f"当前状态 {job.status} 不可调整方向（需 running）"
+            self.store.save(job)
+            return job
+
+        try:
+            from entity_intel.graph import resume_investigation
+
+            result = resume_investigation(job.thread_id, action="adjust",
+                                          instruction=instruction)
+            job.progress = result.get("progress", job.progress)
+            job.investigation_rounds = result.get("all_rounds", [])
+            job.leads = result.get("leads", [])
+            job.plan = result.get("plan", job.plan)
+            job.add_progress("adjust_direction", f"已调整方向: {instruction}")
+
+            # 调整后可能继续执行到下一暂停点或 review
+            analysis = result.get("analysis")
+            if analysis and analysis.entity_summary:
+                job.report = analysis.to_dict()
+                job.report_markdown = analysis.to_markdown()
+            if result.get("decision") in ("stop",):
+                job.status = "stopped"
+                job.add_progress("stop", "用户中途停止调查")
+            elif result.get("analysis") and result["analysis"].entity_summary:
+                job.status = "review"
+                job.add_progress("review", "报告已生成，等待用户审阅决定是否构建知识图谱")
+
+        except Exception as e:
+            job.status = "error"
+            job.error = f"调整方向失败: {e}"
+            job.add_progress("error", f"调整方向失败: {e}")
+
+        self.store.save(job)
+        return job
+
+    def continue_direction(self, job_id: str) -> InvestigationJob:
+        """P2.3: 用户在 analyze_leads 暂停点选择继续（不调整）"""
+        job = self._require(job_id)
+        if job.status != "running":
+            job.error = f"当前状态 {job.status} 不可继续（需 running）"
+            self.store.save(job)
+            return job
+        try:
+            from entity_intel.graph import resume_investigation
+            result = resume_investigation(job.thread_id, action="continue")
+            job.progress = result.get("progress", job.progress)
+            job.investigation_rounds = result.get("all_rounds", [])
+            job.leads = result.get("leads", [])
+            job.plan = result.get("plan", job.plan)
+            analysis = result.get("analysis")
+            if analysis and analysis.entity_summary:
+                job.report = analysis.to_dict()
+                job.report_markdown = analysis.to_markdown()
+                job.status = "review"
+                job.add_progress("review", "报告已生成，等待用户审阅决定是否构建知识图谱")
+        except Exception as e:
+            job.status = "error"
+            job.error = f"继续调查失败: {e}"
+        self.store.save(job)
+        return job
+
+    def stop_investigation(self, job_id: str) -> InvestigationJob:
+        """P2.3: 用户在 analyze_leads 暂停点选择中途停止"""
+        job = self._require(job_id)
+        try:
+            from entity_intel.graph import resume_investigation
+            result = resume_investigation(job.thread_id, action="stop")
+            job.progress = result.get("progress", job.progress)
+        except Exception:
+            pass
+        job.status = "stopped"
+        job.add_progress("stop", "用户中途停止调查")
         self.store.save(job)
         return job
 

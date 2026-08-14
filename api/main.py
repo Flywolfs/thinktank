@@ -41,6 +41,7 @@ class InvestigateRequest(BaseModel):
     goal: str = ""
     max_rounds: int = 30
     plan_provider: str = ""     # auto/hermes/local（空=config 默认 auto）
+    adjustable: bool = False    # P2.3: 每轮可中途调整方向
 
 
 # ── 调查流程 API ──────────────────────────────────────
@@ -62,8 +63,10 @@ def investigate(req: InvestigateRequest):
         goal=req.goal.strip(),
         max_rounds=rounds,
         plan_provider=provider,
+        adjustable=req.adjustable,
     )
-    return {"job_id": job.id, "status": job.status, "plan_provider": provider or "auto"}
+    return {"job_id": job.id, "status": job.status, "plan_provider": provider or "auto",
+            "adjustable": req.adjustable}
 
 
 @app.get("/api/jobs")
@@ -112,6 +115,42 @@ def reject_job(job_id: str):
     """用户拒绝/丢弃"""
     try:
         job = _mgr.reject(job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return job.to_dict()
+
+
+# ── P2.3 中途调整方向 ─────────────────────────────────
+
+class AdjustRequest(BaseModel):
+    instruction: str = ""   # 调整指令（如"别追争议了，专注资金链"）
+
+
+@app.post("/api/jobs/{job_id}/adjust")
+def adjust_job(job_id: str, req: AdjustRequest):
+    """P2.3: 用户中途调整调查方向（analyze_leads 暂停点 resume）"""
+    try:
+        job = _mgr.adjust_direction(job_id, req.instruction)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/continue")
+def continue_job(job_id: str):
+    """P2.3: 用户在暂停点选择继续（不调整）"""
+    try:
+        job = _mgr.continue_direction(job_id)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e))
+    return job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/stop")
+def stop_job(job_id: str):
+    """P2.3: 用户中途停止"""
+    try:
+        job = _mgr.stop_investigation(job_id)
     except FileNotFoundError as e:
         raise HTTPException(404, str(e))
     return job.to_dict()

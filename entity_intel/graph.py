@@ -63,6 +63,9 @@ class InvestigationState(TypedDict):
     parallel_leads: Annotated[list[dict], add]  # 本轮并行深挖的线索（Send 分发）
     parallel_results: Annotated[list[dict], add]  # 各线索搜索结果（合并用）
 
+    # P2.3 中途调整方向
+    adjustable: bool                # true=每轮 analyze_leads interrupt 等用户决定
+
     # 当前轮结果（report 跨轮累积）
     report: EntityReport
     analysis: AnalysisReport
@@ -629,13 +632,61 @@ def deep_audio_node(state: InvestigationState) -> dict:
 
 
 def analyze_leads_node(state: InvestigationState) -> dict:
-    """执行控制：维护线索队列 + 判断是否并行深挖线索 / 进入下一维度 / 完成"""
+    """执行控制：维护线索队列 + 判断是否并行深挖线索 / 进入下一维度 / 完成
+
+    adjustable=true 时每轮 interrupt，用户可选继续/调整方向（P2.3）"""
     logger = _get_logger(state)
     report = state["report"]
     plan = state.get("plan", [])
     plan_index = state.get("plan_index", 0)
     round_num = state.get("round", 1)
     max_rounds = state.get("max_rounds", 30)
+
+    # P2.3: 可调整模式 → 每轮 interrupt 等用户决定方向
+    if state.get("adjustable"):
+        current_dim = plan[plan_index] if plan and plan_index < len(plan) else None
+        remaining = [d.get("name", "?") for d in plan[plan_index:]] if plan else []
+        decision = interrupt({
+            "question": "调查进行中，是否调整方向？",
+            "entity_name": state["entity_name"],
+            "round": round_num,
+            "current_dimension": (current_dim.get("name", "") if current_dim else ""),
+            "remaining_dimensions": remaining,
+            "leads_found": [l.get("name") for l in state.get("leads", [])[:10]],
+            "options": {
+                "continue": "继续当前计划",
+                "adjust": "输入指令调整剩余维度（如：别追争议了，专注资金链）",
+            },
+        })
+        action = "continue"
+        instruction = ""
+        if isinstance(decision, dict):
+            action = decision.get("action", "continue")
+            instruction = decision.get("instruction", "")
+        if action == "adjust" and instruction.strip():
+            # 用 LLM 重排剩余维度
+            new_plan, summary = _adjust_direction(
+                state, plan, plan_index, instruction.strip()
+            )
+            if new_plan:
+                logger.decision("analyze_leads", "adjust_direction",
+                                reason=summary, detail={"instruction": instruction,
+                                                         "new_plan": [d.get("name") for d in new_plan]})
+                plan = new_plan
+                # 保持 plan_index（用户调整的是剩余维度），但确保不越界
+                plan_index = min(plan_index, max(0, len(plan) - 1))
+            else:
+                logger.decision("analyze_leads", "adjust_failed",
+                                reason="重排失败，沿用原计划", detail={"instruction": instruction})
+        elif action == "stop":
+            logger.decision("analyze_leads", "stop", reason="用户中途停止",
+                            detail={"round": round_num})
+            return {
+                "leads": [l for l in state.get("leads", [])],
+                "all_rounds": state.get("all_rounds", []),
+                "decision": "stop",
+                "progress": _add_progress(state, "analyze_leads", "用户中途停止调查"),
+            }
 
     # 维护线索队列（记录发现，供报告使用）
     leads = [Lead(**l) for l in state.get("leads", [])]
@@ -682,6 +733,7 @@ def analyze_leads_node(state: InvestigationState) -> dict:
         result: dict = {
             "leads": queue.to_dict_list(),
             "all_rounds": all_rounds,
+            "plan": plan,                    # 写回（可能被 P2.3 调整过）
             "decision": "stop",
             "progress": _add_progress(state, "analyze_leads", f"收敛({reason})"),
         }
@@ -698,6 +750,7 @@ def analyze_leads_node(state: InvestigationState) -> dict:
     result: dict = {
         "leads": queue.to_dict_list(),
         "all_rounds": all_rounds,
+        "plan": plan,                    # 写回（可能被 P2.3 调整过）
         "plan_index": next_index,
         "search_plan": next_dim.get("queries", [state["entity_name"]]),
         "round": round_num + 1,
@@ -714,6 +767,64 @@ def analyze_leads_node(state: InvestigationState) -> dict:
 # ── P2.2 线索并行 ─────────────────────────────────────
 
 MAX_PARALLEL_LEADS = 3  # 每轮最多并行深挖的线索数（防止资源过载）
+
+
+def _adjust_direction(
+    state: InvestigationState, plan: list[dict], plan_index: int, instruction: str,
+) -> tuple[list[dict] | None, str]:
+    """P2.3: 用户中途调整方向 → LLM 重排剩余维度。
+
+    返回 (new_plan, summary)。new_plan 为 None 表示调整失败（沿用原计划）。
+    """
+    try:
+        from shared.llm.client import LLMClient
+
+        llm = LLMClient()
+        entity = state["entity_name"]
+        hints = state.get("hints", "")
+        done_dims = [d.get("name", "?") for d in plan[:plan_index]]
+        remaining = [
+            {"name": d.get("name", ""), "priority": d.get("priority", "medium"),
+             "queries": d.get("queries", []), "rationale": d.get("rationale", "")[:200]}
+            for d in plan[plan_index:]
+        ]
+
+        prompt = f"""调查核心实体: {entity}
+用户关注方向: {hints or "（无）"}
+
+【已执行维度】{done_dims or "（无）"}
+【当前剩余维度】
+{remaining}
+
+【用户新指令】{instruction}
+
+请根据新指令重排/修改【剩余维度】。输出 JSON:
+{{
+  "dimensions": [
+    {{
+      "name": "维度名",
+      "methodology_source": "引用的方法论来源",
+      "rationale": "为什么保留/新增",
+      "queries": ["搜索角度1", "搜索角度2"],
+      "priority": "high|medium|low"
+    }}
+  ],
+  "summary": "一句话说明调整思路"
+}}
+
+规则:
+1. 用户指令明确提到的方向 → 新增或提前 + high 优先级
+2. 用户指令明确要放弃的方向 → 删除
+3. 未涉及的原剩余维度 → 可保留（按相关性排序）
+4. 3-7 个维度；基线档案（若在剩余中）保持第一
+"""
+        data = llm.extract_json(prompt, "请调整调查方向", temperature=0.2, max_tokens=4000)
+        dims = [d for d in data.get("dimensions", []) if d.get("name") and d.get("queries")]
+        if not dims:
+            return None, "LLM 返回空维度"
+        return dims, data.get("summary", f"已按指令调整: {len(dims)} 个剩余维度")
+    except Exception as e:
+        return None, f"调整失败: {e}"
 
 
 def route_after_analyze(state: InvestigationState) -> list[Send] | str:
@@ -997,9 +1108,12 @@ def get_graph():
 
 def run_investigation(
     entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30,
-    job_id: str = "", plan_provider: str = "",
+    job_id: str = "", plan_provider: str = "", adjustable: bool = False,
 ) -> tuple[dict, str]:
-    """执行调查（多轮深挖）到 review 暂停点。返回 (result_state, thread_id)"""
+    """执行调查（多轮深挖）到 review 暂停点。返回 (result_state, thread_id)
+
+    adjustable=True 时每轮 analyze_leads interrupt，用户可中途调整方向（P2.3）。
+    """
     thread_id = f"inv_{int(time.time()*1000)}"
     config = {"configurable": {"thread_id": thread_id}}
 
@@ -1019,6 +1133,7 @@ def run_investigation(
         "asr_count": 0,
         "parallel_leads": [],
         "parallel_results": [],
+        "adjustable": adjustable,
         "report": EntityReport(entity_name=entity_name),
         "analysis": AnalysisReport(entity_name=entity_name),
         "progress": [],
@@ -1038,10 +1153,23 @@ def run_investigation(
     return result, thread_id
 
 
-def resume_investigation(thread_id: str, action: str) -> dict:
-    """用户在 review 暂停点做出决定后继续。action: approve / reject"""
+def resume_investigation(thread_id: str, action: str, instruction: str = "") -> dict:
+    """在暂停点继续调查。
+
+    action:
+      approve / reject — review 节点（用户审阅报告后）
+      continue         — analyze_leads 节点（P2.3 每轮暂停后继续）
+      adjust           — analyze_leads 节点（P2.3 调整方向，instruction 为新指令）
+      stop             — analyze_leads 节点（P2.3 中途停止）
+    """
     config = {"configurable": {"thread_id": thread_id}}
-    result = get_graph().invoke(Command(resume={"action": action}), config)
+    if action == "adjust":
+        resume = {"action": "adjust", "instruction": instruction}
+    elif action in ("continue", "stop"):
+        resume = {"action": action}
+    else:  # approve / reject
+        resume = {"action": action}
+    result = get_graph().invoke(Command(resume=resume), config)
     return result
 
 
