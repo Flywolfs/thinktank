@@ -66,6 +66,11 @@ class InvestigationState(TypedDict):
     # P2.3 中途调整方向
     adjustable: bool                # true=每轮 analyze_leads interrupt 等用户决定
 
+    # P4.2 图谱递归血统
+    parent_job_id: str              # 父调查 job_id（图谱深挖来源）
+    parent_entity: str              # 父调查的核心实体名（血统边起点）
+    parent_relation: str            # 与父实体的关系
+
     # 当前轮结果（report 跨轮累积）
     report: EntityReport
     analysis: AnalysisReport
@@ -1013,13 +1018,16 @@ def review_node(state: InvestigationState) -> dict:
 
 
 def graph_build_node(state: InvestigationState) -> dict:
-    """构建 Neo4j 知识图谱（走 Tool Registry，留痕）"""
+    """构建 Neo4j 知识图谱（走 Tool Registry，留痕 + P4.2 血统）"""
     from shared.tools.registry import get_registry
 
     analysis = state["analysis"]
     stats = get_registry().call(
         "graph_build", job_id=state.get("job_id", ""),
         entity_name=state["entity_name"], report=state["report"], analysis=analysis,
+        parent_job_id=state.get("parent_job_id", ""),
+        parent_entity=state.get("parent_entity", ""),
+        parent_relation=state.get("parent_relation", ""),
     )
 
     return {
@@ -1109,10 +1117,12 @@ def get_graph():
 def run_investigation(
     entity_name: str, hints: str = "", goal: str = "", max_rounds: int = 30,
     job_id: str = "", plan_provider: str = "", adjustable: bool = False,
+    parent_job_id: str = "", parent_entity: str = "", parent_relation: str = "",
 ) -> tuple[dict, str]:
     """执行调查（多轮深挖）到 review 暂停点。返回 (result_state, thread_id)
 
     adjustable=True 时每轮 analyze_leads interrupt，用户可中途调整方向（P2.3）。
+    parent_*: P4.2 图谱递归血统（父调查来源）。
     """
     thread_id = f"inv_{int(time.time()*1000)}"
     config = {"configurable": {"thread_id": thread_id}}
@@ -1134,6 +1144,9 @@ def run_investigation(
         "parallel_leads": [],
         "parallel_results": [],
         "adjustable": adjustable,
+        "parent_job_id": parent_job_id,
+        "parent_entity": parent_entity,
+        "parent_relation": parent_relation,
         "report": EntityReport(entity_name=entity_name),
         "analysis": AnalysisReport(entity_name=entity_name),
         "progress": [],

@@ -242,7 +242,36 @@
             </template>
             <div ref="graphEl" class="graph-canvas"></div>
             <div v-if="!graphEntities.length" class="empty-hint">
-              输入实体名查询知识图谱（Neo4j），可调跳数展开
+              输入实体名查询知识图谱（Neo4j），可调跳数展开；点击节点可继续深挖
+            </div>
+
+            <!-- P4.2 深挖面板 -->
+            <div v-if="deepDiveTarget" class="deepdive-panel">
+              <div class="deepdive-title">
+                🔍 继续深挖: <b>{{ deepDiveTarget }}</b>
+                <el-tag v-if="deepDiveStatus === 'investigated'" type="warning" size="small" style="margin-left: 8px">
+                  已挖过 {{ deepDiveCount || 0 }} 次
+                </el-tag>
+                <el-tag v-else type="success" size="small" style="margin-left: 8px">未调查</el-tag>
+              </div>
+              <el-form label-position="top" size="small">
+                <el-form-item label="关注方向 (hints，自动继承父关系)">
+                  <el-input v-model="deepDiveHints" :rows="1" />
+                </el-form-item>
+                <el-form-item label="深挖轮数">
+                  <el-slider v-model="deepDiveRounds" :min="1" :max="30" style="width: 100%" />
+                </el-form-item>
+                <el-form-item>
+                  <el-checkbox v-model="deepDiveAutoReworth">
+                    遇到成环时由系统决定是否重挖
+                  </el-checkbox>
+                  <div class="field-hint">开: 强新线索自动重挖(上限3次)；关: 每次撞回都询问</div>
+                </el-form-item>
+                <el-button type="primary" size="small" :loading="deepDiving" @click="startDeepDive">
+                  开始深挖
+                </el-button>
+                <el-button size="small" @click="deepDiveTarget = null">取消</el-button>
+              </el-form>
             </div>
           </el-card>
         </el-col>
@@ -269,6 +298,14 @@ const graphEl = ref(null)
 const graphDepth = ref(1)
 const logs = ref([])
 const logLevel = ref('')
+// P4.2 深挖
+const deepDiveTarget = ref('')
+const deepDiveHints = ref('')
+const deepDiveRounds = ref(6)
+const deepDiveAutoReworth = ref(true)
+const deepDiveStatus = ref('')      // investigated / new
+const deepDiveCount = ref(0)
+const deepDiving = ref(false)
 let graphChart = null
 let pollTimer = null
 
@@ -567,13 +604,68 @@ function renderGraph(entities, centerName) {
       emphasis: { focus: 'adjacency' },
     }],
   })
-  // 节点点击 → 展开
+  // P4.1/4.2: 单击节点 → 深挖面板（查实体状态）；双击 → 展开子图
   graphChart.off('click')
+  graphChart.off('dblclick')
   graphChart.on('click', params => {
+    if (params.dataType === 'node') {
+      openDeepDive(params.data.name)
+    }
+  })
+  graphChart.on('dblclick', params => {
     if (params.dataType === 'node' && params.data.name !== centerName) {
       queryGraph(params.data.name)
     }
   })
+}
+
+// ── P4.2 深挖 ─────────────────────────────────────────
+async function openDeepDive(name) {
+  deepDiveTarget.value = name
+  deepDiveHints.value = currentJob.value?.hints || ''
+  deepDiveRounds.value = 6
+  deepDiveAutoReworth.value = true
+  // 查实体状态（已挖过？）
+  try {
+    const { data } = await axios.get(`/api/graph/entity/${encodeURIComponent(name)}`)
+    if (data.found && data.entity.investigated) {
+      deepDiveStatus.value = 'investigated'
+      deepDiveCount.value = data.entity.investigated_count || 1
+    } else {
+      deepDiveStatus.value = 'new'
+      deepDiveCount.value = 0
+    }
+  } catch (e) {
+    deepDiveStatus.value = 'new'
+    deepDiveCount.value = 0
+  }
+}
+
+async function startDeepDive() {
+  if (!deepDiveTarget.value || !currentJob.value) return
+  deepDiving.value = true
+  try {
+    const { data } = await axios.post('/api/investigate', {
+      entity_name: deepDiveTarget.value,
+      hints: deepDiveHints.value.trim(),
+      goal: `图谱递归深挖: 从 ${currentJob.value.entity_name} 调查继续`,
+      max_rounds: deepDiveRounds.value,
+      plan_provider: 'auto',
+      adjustable: false,
+      parent_job_id: currentJob.value.id,
+      parent_entity: currentJob.value.entity_name,
+      parent_relation: '图谱关联',
+    })
+    ElMessage.success('已发起深挖调查')
+    deepDiveTarget.value = null
+    const { data: jobData } = await axios.get(`/api/jobs/${data.job_id}`)
+    currentJob.value = jobData
+    startPolling(data.job_id)
+  } catch (e) {
+    ElMessage.error('深挖失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    deepDiving.value = false
+  }
 }
 
 // ── 工具 ──────────────────────────────────────────────
@@ -636,6 +728,8 @@ onBeforeUnmount(() => {
 .log-code { color: #b0b3b8; font-family: monospace; font-size: 11px; margin-top: 2px; }
 .log-error .log-detail { color: #f56c6c; }
 .log-debug .log-detail { color: #999; }
+.deepdive-panel { border-top: 1px solid #eee; padding-top: 12px; margin-top: 8px; background: #fafbfc; padding: 12px; border-radius: 6px; }
+.deepdive-title { margin-bottom: 8px; font-size: 14px; }
 .report-body { font-size: 13px; line-height: 1.7; max-height: 500px; overflow-y: auto; }
 .report-body h2 { font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
 .report-body h3 { font-size: 15px; margin-top: 16px; }

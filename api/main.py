@@ -44,6 +44,9 @@ class InvestigateRequest(BaseModel):
     max_rounds: int = 30
     plan_provider: str = ""     # auto/hermes/local（空=config 默认 auto）
     adjustable: bool = False    # P2.3: 每轮可中途调整方向
+    parent_job_id: str = ""     # P4.2: 血统 — 父调查 job_id（图谱递归深挖）
+    parent_entity: str = ""     # P4.2: 血统 — 父调查的核心实体名
+    parent_relation: str = ""   # P4.2: 血统 — 与父实体的关系
 
 
 # ── 调查流程 API ──────────────────────────────────────
@@ -66,6 +69,9 @@ def investigate(req: InvestigateRequest):
         max_rounds=rounds,
         plan_provider=provider,
         adjustable=req.adjustable,
+        parent_job_id=req.parent_job_id,
+        parent_entity=req.parent_entity,
+        parent_relation=req.parent_relation,
     )
     return {"job_id": job.id, "status": job.status, "plan_provider": provider or "auto",
             "adjustable": req.adjustable}
@@ -300,6 +306,19 @@ def get_subgraph(name: str, depth: int = 1):
         client = Neo4jClient()
         subgraph = client.get_subgraph(name, depth=depth)
         return {"name": name, "depth": depth, "entities": subgraph}
+    except Exception as e:
+        raise HTTPException(500, f"图谱查询失败: {e}")
+
+
+@app.get("/api/graph/entity/{name}")
+def get_entity_status(name: str):
+    """P4.2: 实体节点状态（investigated 标记 / 血统 / 重挖价值）"""
+    try:
+        client = Neo4jClient()
+        entity = client.get_entity(name)
+        if not entity:
+            return {"found": False, "name": name}
+        return {"found": True, "entity": entity}
     except Exception as e:
         raise HTTPException(500, f"图谱查询失败: {e}")
 

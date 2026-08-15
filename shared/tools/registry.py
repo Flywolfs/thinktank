@@ -352,25 +352,69 @@ def _register_graph_tools(reg: ToolRegistry) -> None:
     )
 
     # 知识图谱全量构建（对应 graph_build_node）
-    def graph_build_handler(report, analysis, entity_name: str):
+    def graph_build_handler(report, analysis, entity_name: str, parent_job_id: str = "",
+                            parent_entity: str = "", parent_relation: str = ""):
+        """P4.2 版图谱构建:
+        1. 实体归一化（中文简体/英文lowercase/别名）→ 同名合并
+        2. investigated 标记 + 别名增量学习
+        3. 关系证据累积（复用旧 rel_type + new_finding）
+        4. 血统边: 父调查实体 → 本实体（有 parent 时）
+        """
+        from shared.nlp.entity_normalize import get_normalizer
         from shared.storage.neo4j_client import Neo4jClient
+
+        normalizer = get_normalizer()
         client = Neo4jClient()
         client.ensure_indexes()
+
+        # 核心实体归一化 + 标记
+        core_key = normalizer.normalize(entity_name)
         client.merge_entity(
-            entity_name, entity_type="person",
+            core_key, entity_type="person",
             summary=(analysis.entity_summary or "")[:500],
             source="investigation",
         )
+        client.mark_investigated(core_key)
+        if entity_name != core_key:
+            client.add_alias(core_key, entity_name)
+
+        # 关联实体归一化入库
         for e in (analysis.suggested_entities or []):
+            name = e.get("name", "")
+            if not name:
+                continue
+            key = normalizer.normalize(name)
+            if not key:
+                continue
             client.merge_entity(
-                e.get("name", ""), entity_type=e.get("type", ""), source="investigation"
+                key, entity_type=e.get("type", ""), source="investigation"
             )
+            if name != key:
+                client.add_alias(key, name)
+
+        # 关系（归一化后 merge，同向边证据累积）
         rel_count = 0
         for r in (analysis.suggested_relations or []):
             frm, to, rel = r.get("from", ""), r.get("to", ""), r.get("relation", "")
-            if frm and to and rel:
-                client.merge_relation(frm, to, rel, source="investigation")
-                rel_count += 1
+            if not (frm and to and rel):
+                continue
+            frm_key = normalizer.normalize(frm)
+            to_key = normalizer.normalize(to)
+            if not (frm_key and to_key):
+                continue
+            client.merge_relation(
+                frm_key, to_key, rel, source="investigation",
+                new_finding=(r.get("evidence", "") or r.get("rationale", "") or "")[:300],
+            )
+            rel_count += 1
+
+        # 血统边（图谱递归深挖时）: 父实体 → 本实体
+        if parent_entity:
+            client.merge_relation(
+                parent_entity, core_key, "调查关联", source="investigation",
+                new_finding=f"从父调查 {parent_job_id or '?'} 深挖而来 ({parent_relation or '关联'})",
+            )
+
         return {"entities": len(analysis.suggested_entities or []), "relations": rel_count}
 
     reg.register(
@@ -380,8 +424,9 @@ def _register_graph_tools(reg: ToolRegistry) -> None:
             category="graph", cost="medium", provider="neo4j",
             parameters=[ToolParam("entity_name", "string", "核心实体名")],
         ),
-        lambda entity_name, report=None, analysis=None: graph_build_handler(
-            report, analysis, entity_name
+        lambda entity_name, report=None, analysis=None, parent_job_id="", parent_entity="", parent_relation="": graph_build_handler(
+            report, analysis, entity_name, parent_job_id=parent_job_id,
+            parent_entity=parent_entity, parent_relation=parent_relation,
         ),
     )
 

@@ -49,10 +49,13 @@ class Neo4jClient:
         entity_type: str = "",
         summary: str = "",
         source: str = "",
+        investigated: bool | None = None,
+        aliases: list | None = None,
         **attrs,
     ) -> str:
         """
         创建或更新实体节点。同名实体合并，追加新属性。
+        P4.2: investigated 标记 + aliases 别名列表（归一化用）。
         返回实体 name。
         """
         with self.driver.session() as session:
@@ -79,6 +82,38 @@ class Neo4jClient:
             record = result.single()
             return record["name"] if record else name
 
+    def mark_investigated(self, name: str, count: int = 1) -> None:
+        """P4.2: 标记实体已调查（investigated_count 递增）"""
+        with self.driver.session() as session:
+            session.run(
+                """
+                MERGE (e:Entity {name: $name})
+                SET e.investigated = true,
+                    e.investigated_count = coalesce(e.investigated_count, 0) + $count,
+                    e.last_investigated_at = datetime()
+                """,
+                name=name,
+                count=count,
+            )
+
+    def add_alias(self, key: str, alias: str) -> None:
+        """P4.2: 别名增量学习 — 把新 name 加入实体 alias 列表"""
+        if not key or not alias or alias == key:
+            return
+        with self.driver.session() as session:
+            session.run(
+                """
+                MERGE (e:Entity {name: $key})
+                SET e.aliases = CASE
+                    WHEN e.aliases IS NULL THEN [$alias]
+                    WHEN $alias IN e.aliases THEN e.aliases
+                    ELSE e.aliases + $alias
+                END
+                """,
+                key=key,
+                alias=alias,
+            )
+
     # ── 关系 CRUD ───────────────────────────────────────
 
     def merge_relation(
@@ -87,11 +122,13 @@ class Neo4jClient:
         to_entity: str,
         relation: str,
         source: str = "",
+        new_finding: str = "",
         **attrs,
     ):
         """
         创建或更新两个实体之间的关系。
-        关系类型根据 relation 文本动态生成（蛇形命名）。
+        P4.2 证据累积: 已存在同向边 → 不新建，追加证据
+        (evidence_count 递增, sources 追加, new_finding 覆盖为最近一次)。
         """
         rel_type = self._to_rel_type(relation)
 
@@ -100,34 +137,104 @@ class Neo4jClient:
         self.merge_entity(to_entity, source=source)
 
         with self.driver.session() as session:
-            session.run(
+            # 查同向边是否存在
+            existing = session.run(
                 f"""
                 MATCH (a:Entity {{name: $from_name}})
                 MATCH (b:Entity {{name: $to_name}})
-                MERGE (a)-[r:{rel_type}]->(b)
-                SET r.relation = $relation,
-                    r.source = $source,
-                    r.last_seen = datetime()
-                SET r += $attrs
+                MATCH (a)-[r:{rel_type}]->(b)
+                RETURN r.relation AS relation, r.evidence_count AS evidence_count
                 """,
                 from_name=from_entity,
                 to_name=to_entity,
-                relation=relation,
-                source=source,
-                attrs=attrs,
-            )
+            ).single()
+
+            if existing:
+                # 同向边已存在 → 证据累积（ON MATCH 语义）
+                session.run(
+                    f"""
+                    MATCH (a:Entity {{name: $from_name}})
+                    MATCH (b:Entity {{name: $to_name}})
+                    MATCH (a)-[r:{rel_type}]->(b)
+                    SET r.relation = $relation,
+                        r.last_seen = datetime(),
+                        r.evidence_count = coalesce(r.evidence_count, 1) + 1,
+                        r.sources = CASE
+                            WHEN r.sources IS NULL THEN [$source]
+                            WHEN $source IN r.sources THEN r.sources
+                            ELSE r.sources + $source
+                        END
+                    SET r += $attrs
+                    """,
+                    from_name=from_entity,
+                    to_name=to_entity,
+                    relation=relation,
+                    source=source,
+                    attrs=attrs,
+                )
+                # 更新 new_finding（单独写避免 attrs 冲突）
+                if new_finding:
+                    session.run(
+                        f"""
+                        MATCH (a:Entity {{name: $from_name}})-[r:{rel_type}]->(b:Entity {{name: $to_name}})
+                        SET r.new_finding = $new_finding
+                        """,
+                        from_name=from_entity,
+                        to_name=to_entity,
+                        new_finding=new_finding[:300],
+                    )
+            else:
+                # 新建边
+                session.run(
+                    f"""
+                    MATCH (a:Entity {{name: $from_name}})
+                    MATCH (b:Entity {{name: $to_name}})
+                    MERGE (a)-[r:{rel_type}]->(b)
+                    SET r.relation = $relation,
+                        r.source = $source,
+                        r.last_seen = datetime(),
+                        r.evidence_count = 1,
+                        r.sources = [$source]
+                    SET r += $attrs
+                    """,
+                    from_name=from_entity,
+                    to_name=to_entity,
+                    relation=relation,
+                    source=source,
+                    attrs=attrs,
+                )
+                if new_finding:
+                    session.run(
+                        f"""
+                        MATCH (a:Entity {{name: $from_name}})-[r:{rel_type}]->(b:Entity {{name: $to_name}})
+                        SET r.new_finding = $new_finding
+                        """,
+                        from_name=from_entity,
+                        to_name=to_entity,
+                        new_finding=new_finding[:300],
+                    )
 
     @staticmethod
     def _to_rel_type(relation_text: str) -> str:
-        """将中文关系描述转为合法的 Cypher 关系类型"""
-        # 英文优先，中文用拼音首字母或直接 ROMANIZED
+        """将关系描述转为合法的 Cypher 关系类型（稳定且区分语义）
+
+        P4.2 修复: 纯中文关系不再一律返回 RELATED_TO——
+        用哈希生成稳定 rel_type（同文字→同类型，不同文字→不同类型），
+        保证"朋友"和"资助方"是两条不同边（2.6 设计）。
+        """
         import re
-        # 提取英文字母和数字
-        alpha = re.sub(r"[^a-zA-Z0-9]", "_", relation_text)
+        import hashlib
+
+        text = (relation_text or "").strip()
+        if not text:
+            return "RELATED_TO"
+        # 英文优先（直接用英文作为类型）
+        alpha = re.sub(r"[^a-zA-Z0-9]", "_", text)
         if len(alpha.strip("_")) > 1:
             return alpha.strip("_").upper()[:30]
-        # 纯中文 → 用 ROMANIZED 前缀
-        return f"RELATED_TO"
+        # 纯中文/其他 → 哈希生成稳定类型（前缀 REL_ + 8位哈希）
+        digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8].upper()
+        return f"REL_{digest}"
 
     # ── 查询 ────────────────────────────────────────────
 

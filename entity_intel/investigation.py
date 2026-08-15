@@ -26,6 +26,9 @@ class InvestigationJob:
     goal: str = ""
     plan_provider: str = ""             # auto/hermes/local（空=config 默认）
     adjustable: bool = False            # P2.3: 每轮可调整方向
+    parent_job_id: str = ""             # P4.2: 血统 — 父调查
+    parent_entity: str = ""             # P4.2: 血统 — 父调查的核心实体名
+    parent_relation: str = ""           # P4.2: 血统 — 与父调查实体的关系
     status: str = "pending"           # pending/running/review/approved/rejected/error
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -51,6 +54,9 @@ class InvestigationJob:
             "goal": self.goal,
             "plan_provider": self.plan_provider,
             "adjustable": self.adjustable,
+            "parent_job_id": self.parent_job_id,
+            "parent_entity": self.parent_entity,
+            "parent_relation": self.parent_relation,
             "status": self.status,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -119,10 +125,12 @@ class InvestigationManager:
     def start(
         self, entity_name: str, hints: str = "", goal: str = "",
         max_rounds: int = 30, plan_provider: str = "", adjustable: bool = False,
+        parent_job_id: str = "", parent_entity: str = "", parent_relation: str = "",
     ) -> InvestigationJob:
         """启动一次调查（多轮深挖），执行到 review 暂停点。
 
         adjustable=True 时每轮 analyze_leads interrupt，用户可中途调整方向（P2.3）。
+        parent_*: P4.2 血统（图谱递归深挖时记录来源）。
         """
         job = InvestigationJob(
             entity_name=entity_name,
@@ -130,6 +138,9 @@ class InvestigationManager:
             goal=goal,
             plan_provider=plan_provider,
             adjustable=adjustable,
+            parent_job_id=parent_job_id,
+            parent_entity=parent_entity,
+            parent_relation=parent_relation,
             status="running",
         )
         job.add_progress("start", f"开始调查实体: {entity_name} (最多 {max_rounds} 轮深挖)")
@@ -141,6 +152,8 @@ class InvestigationManager:
             result, thread_id = run_investigation(
                 entity_name, hints=hints, goal=goal, max_rounds=max_rounds,
                 job_id=job.id, plan_provider=plan_provider, adjustable=adjustable,
+                parent_job_id=job.parent_job_id, parent_entity=job.parent_entity,
+                parent_relation=job.parent_relation,
             )
 
             # 从图状态同步结果
