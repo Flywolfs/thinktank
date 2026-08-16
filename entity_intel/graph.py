@@ -608,6 +608,11 @@ def deep_audio_node(state: InvestigationState) -> dict:
     from shared.crawlers.bilibili import BilibiliCLIProvider
     from shared.utils import config
     import httpx
+    import shutil
+    from pathlib import Path as _Path
+
+    # 音频+转录持久化目录: data/raw/bilibili/{bvid}/
+    RAW_BILI_DIR = _Path(__file__).resolve().parent.parent / "data" / "raw" / "bilibili"
 
     provider = BilibiliCLIProvider()
     done = 0
@@ -621,7 +626,7 @@ def deep_audio_node(state: InvestigationState) -> dict:
                 with open(m, "rb") as f:
                     resp = httpx.post(
                         f"{config.QWEN3_ASR_URL}/v1/audio/transcriptions",
-                        files={"file": ("audio.wav", f, "audio/wav")},
+                        files=({"file": ("audio.wav", f, "audio/wav")}),
                         data={"language": "zh"}, timeout=300,
                     )
                 resp.raise_for_status()
@@ -631,6 +636,45 @@ def deep_audio_node(state: InvestigationState) -> dict:
             v.metadata["asr_text"] = full_text
             v.metadata["asr_done"] = True
             done += 1
+
+            # ── 持久化: 音频复制 + 转录全文写盘（P4.2 后补）──
+            try:
+                save_dir = RAW_BILI_DIR / bvid
+                audio_dir = save_dir / "audio"
+                audio_dir.mkdir(parents=True, exist_ok=True)
+                # 1. 复制音频（原始片段 + 合并后的送 ASR 块）
+                copied = 0
+                for f in segs:
+                    src = _Path(f)
+                    if src.exists() and src.suffix == ".wav":
+                        shutil.copy2(src, audio_dir / src.name)
+                        copied += 1
+                # merged 里软链指向 seg 文件——复制实际 wav
+                for m in merged:
+                    src = _Path(m).resolve()
+                    if src.exists() and src.suffix == ".wav":
+                        shutil.copy2(src, audio_dir / f"asr_{_Path(m).name}")
+                # 2. 转录全文
+                if full_text:
+                    (save_dir / "transcript.txt").write_text(full_text, encoding="utf-8")
+                # 3. 元信息（bvid/标题/来源调查）
+                import json as _json
+                meta = {
+                    "bvid": bvid,
+                    "title": v.title,
+                    "author": v.author,
+                    "url": v.url,
+                    "asr_chars": len(full_text),
+                    "audio_files": copied,
+                    "saved_at": time.time(),
+                }
+                (save_dir / "meta.json").write_text(
+                    _json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                v.metadata["asr_saved"] = str(save_dir)
+            except Exception as save_err:
+                # 存档失败不阻塞调查
+                v.metadata["asr_save_error"] = str(save_err)[:100]
         except Exception as e:
             v.metadata["asr_error"] = str(e)[:100]
             continue
