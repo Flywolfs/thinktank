@@ -164,6 +164,35 @@
             </div>
             <div v-if="!dynTools.length" class="empty-hint">还没有动态工具</div>
           </el-card>
+
+          <!-- 数据源健康状态 -->
+          <el-card shadow="never" class="panel">
+            <template #header>
+              <b>📡 数据源状态</b>
+              <el-button size="small" style="float:right" @click="loadProviderHealth" :loading="healthLoading">
+                刷新
+              </el-button>
+              <el-button size="small" type="warning" style="float:right; margin-right: 8px"
+                         @click="deepHealthCheck" :loading="deepHealthLoading">
+                深度检测
+              </el-button>
+            </template>
+            <div v-if="!providerHealth.length" class="empty-hint">点击刷新查看各数据源状态</div>
+            <div v-else class="health-list">
+              <div v-for="p in providerHealth" :key="p.name" class="health-row">
+                <span class="health-dot" :class="'dot-' + p.status"></span>
+                <b style="width: 90px">{{ sourceLabel(p.name) }}</b>
+                <el-tag size="small" :type="p.status === 'ok' ? 'success' : (p.status === 'error' ? 'danger' : 'warning')">
+                  {{ p.status === 'ok' ? '正常' : (p.status === 'error' ? '异常' : '警告') }}
+                </el-tag>
+                <span class="field-hint" style="flex:1">{{ p.message }}</span>
+                <span class="field-hint" style="width: 50px; text-align: right">{{ p.duration_ms }}ms</span>
+              </div>
+              <div class="field-hint" style="margin-top: 6px">
+                深度检测: 实际搜索验证登录态（慢，每源 10-90s）
+              </div>
+            </div>
+          </el-card>
         </el-col>
 
         <!-- 右侧: 计划 + 报告 + 图谱 -->
@@ -306,6 +335,10 @@ const deepDiveAutoReworth = ref(true)
 const deepDiveStatus = ref('')      // investigated / new
 const deepDiveCount = ref(0)
 const deepDiving = ref(false)
+// 数据源健康
+const providerHealth = ref([])
+const healthLoading = ref(false)
+const deepHealthLoading = ref(false)
 let graphChart = null
 let pollTimer = null
 
@@ -550,6 +583,39 @@ function escapeHtml(s) {
   return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
 }
 
+// ── 数据源健康状态 ────────────────────────────────────
+async function loadProviderHealth() {
+  healthLoading.value = true
+  try {
+    const { data } = await axios.get('/api/health/providers')
+    providerHealth.value = data.providers || []
+  } catch (e) {
+    ElMessage.error('数据源状态获取失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    healthLoading.value = false
+  }
+}
+
+async function deepHealthCheck() {
+  deepHealthLoading.value = true
+  try {
+    const { data } = await axios.get('/api/health/providers', { params: { deep: true } })
+    providerHealth.value = data.providers || []
+    ElMessage.success('深度检测完成')
+  } catch (e) {
+    ElMessage.error('深度检测失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    deepHealthLoading.value = false
+  }
+}
+
+function sourceLabel(name) {
+  return {
+    wikipedia: '维基百科', serper: 'Google', bilibili: 'B站',
+    enterprise: '企业信息', zhihu: '知乎', xiaohongshu: '小红书', weibo: '微博',
+  }[name] || name
+}
+
 // ── 图谱 ──────────────────────────────────────────────
 async function queryGraph(name) {
   const q = name || graphQuery.value
@@ -700,6 +766,7 @@ function renderMarkdown(md) {
 onMounted(() => {
   loadJobs()
   loadDynamicTools()
+  loadProviderHealth()
   window.addEventListener('resize', () => graphChart && graphChart.resize())
 })
 
@@ -730,6 +797,14 @@ onBeforeUnmount(() => {
 .log-debug .log-detail { color: #999; }
 .deepdive-panel { border-top: 1px solid #eee; padding-top: 12px; margin-top: 8px; background: #fafbfc; padding: 12px; border-radius: 6px; }
 .deepdive-title { margin-bottom: 8px; font-size: 14px; }
+.health-list { max-height: 260px; overflow-y: auto; }
+.health-row { display: flex; align-items: center; gap: 8px; padding: 5px 4px; border-bottom: 1px solid #f5f7fa; }
+.health-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot-ok { background: #67c23a; }
+.dot-error { background: #f56c6c; }
+.dot-warning { background: #e6a23c; }
+.dot-unknown { background: #909399; }
+.dot-disabled { background: #c0c4cc; }
 .report-body { font-size: 13px; line-height: 1.7; max-height: 500px; overflow-y: auto; }
 .report-body h2 { font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 6px; }
 .report-body h3 { font-size: 15px; margin-top: 16px; }

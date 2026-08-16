@@ -326,3 +326,20 @@ def get_entity_status(name: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ── 数据源健康检测 ────────────────────────────────────
+
+@app.get("/api/health/providers")
+def providers_health(deep: bool = False):
+    """数据源健康状态（快速检查: 配置/端口/进程）。
+    deep=true 时额外做实际搜索验证（慢，登录态真实验证）"""
+    from shared.crawlers.health import get_health_checker
+    return {"providers": get_health_checker().check_all(include_deep=deep)}
+
+
+@app.get("/api/health/providers/{name}/deep")
+def provider_deep_check(name: str):
+    """深度检测单个数据源（实际搜索验证登录态）"""
+    from shared.crawlers.health import get_health_checker
+    return {"provider": get_health_checker().deep_search_check(name)}
