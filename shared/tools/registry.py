@@ -378,17 +378,34 @@ def _register_graph_tools(reg: ToolRegistry) -> None:
         if entity_name != core_key:
             client.add_alias(core_key, entity_name)
 
-        # 关联实体归一化入库
+        # 关联实体归一化入库（方案A: suggested_entities + extract 全部 related_entities）
+        # 用 set 记录已入库的实体名（去重）
+        merged_entities = {core_key}
         for e in (analysis.suggested_entities or []):
             name = e.get("name", "")
             if not name:
                 continue
             key = normalizer.normalize(name)
-            if not key:
+            if not key or key in merged_entities:
                 continue
+            merged_entities.add(key)
             client.merge_entity(
                 key, entity_type=e.get("type", ""), source="investigation"
             )
+            if name != key:
+                client.add_alias(key, name)
+
+        # extract 阶段抽取的实体也全部入库（不只报告精选的）
+        for e in (report.related_entities or []):
+            name = e.get("name", "") if isinstance(e, dict) else getattr(e, "name", "")
+            if not name:
+                continue
+            key = normalizer.normalize(name)
+            if not key or key in merged_entities or key == core_key:
+                continue
+            merged_entities.add(key)
+            etype = e.get("type", "") if isinstance(e, dict) else getattr(e, "type", "")
+            client.merge_entity(key, entity_type=etype or "", source="investigation")
             if name != key:
                 client.add_alias(key, name)
 
@@ -405,6 +422,30 @@ def _register_graph_tools(reg: ToolRegistry) -> None:
             client.merge_relation(
                 frm_key, to_key, rel, source="investigation",
                 new_finding=(r.get("evidence", "") or r.get("rationale", "") or "")[:300],
+            )
+            rel_count += 1
+
+        # extract 阶段的实体关系也入库（5元组: name/type/relation/evidence/direction）
+        # direction=outgoing: core → entity; incoming: entity → core
+        for e in (report.related_entities or []):
+            if isinstance(e, dict):
+                name, rel = e.get("name", ""), e.get("relation", "")
+            else:
+                name, rel = getattr(e, "name", ""), getattr(e, "relation", "")
+            if not (name and rel):
+                continue
+            name_key = normalizer.normalize(name)
+            if not name_key:
+                continue
+            direction = e.get("direction", "outgoing") if isinstance(e, dict) else getattr(e, "direction", "outgoing")
+            evidence = e.get("evidence", "") if isinstance(e, dict) else getattr(e, "evidence", "")
+            if direction == "incoming":
+                frm_key, to_key = name_key, core_key
+            else:
+                frm_key, to_key = core_key, name_key
+            client.merge_relation(
+                frm_key, to_key, rel, source="investigation",
+                new_finding=(evidence or "")[:300],
             )
             rel_count += 1
 

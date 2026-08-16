@@ -231,7 +231,11 @@ class Neo4jClient:
         # 英文优先（直接用英文作为类型）
         alpha = re.sub(r"[^a-zA-Z0-9]", "_", text)
         if len(alpha.strip("_")) > 1:
-            return alpha.strip("_").upper()[:30]
+            rel = alpha.strip("_").upper()[:30]
+            # Cypher 类型不能以数字开头 → 加 REL_ 前缀
+            if rel[0].isdigit():
+                rel = "REL_" + rel
+            return rel
         # 纯中文/其他 → 哈希生成稳定类型（前缀 REL_ + 8位哈希）
         digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:8].upper()
         return f"REL_{digest}"
