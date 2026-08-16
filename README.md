@@ -195,7 +195,7 @@ data/
 │   └── bilibili/{bvid}/     #   B站视频音频+ASR转录持久化
 │       ├── audio/*.wav      #   原始片段 + 送 ASR 合并块
 │       ├── transcript.txt   #   ASR 转录全文
-│       └── meta.json        #   bvid/标题/作者/来源调查
+│       └── meta.json        #   bvid/标题/作者/来源调查(job_id/entity/round)/来源搜索词
 ├── investigations/   # 调查任务 JSON（HITL 状态机）
 ├── logs/             # 结构化调查日志（file:line:func 定位）
 ├── audit/            # 工具调用审计（跨进程回放）

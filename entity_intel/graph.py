@@ -473,6 +473,16 @@ def _merge_reports(target: EntityReport, new: EntityReport):
     return added
 
 
+def _tag_results_with_query(report: EntityReport, query: str, round_num: int):
+    """给搜索结果打上来源标记（哪个搜索词/第几轮），供音频/转录存档追溯"""
+    for r in report.web_results + report.social_results + report.knowledge_results:
+        if not isinstance(r.metadata, dict):
+            r.metadata = {}
+        if not r.metadata.get("search_query"):
+            r.metadata["search_query"] = query
+            r.metadata["search_round"] = round_num
+
+
 # ── 节点实现 ──────────────────────────────────────────
 
 def search_node(state: InvestigationState) -> dict:
@@ -500,6 +510,7 @@ def search_node(state: InvestigationState) -> dict:
         q0 = queries[0]
         try:
             r = reg.call("search_all", job_id=job_id, query=q0, max_per_source=10)
+            _tag_results_with_query(r, q0, state.get("round", 1))
             _merge_reports(report, r)
             details.append(f"'{q0}'+{r.total_results}")
             if q0 not in visited:
@@ -526,6 +537,7 @@ def search_node(state: InvestigationState) -> dict:
                 else:
                     try:
                         r = reg.call("search_all_fast", job_id=job_id, query=q, max_per_source=10)
+                        _tag_results_with_query(r, q, state.get("round", 1))
                         _merge_reports(report, r)
                         details.append(f"'{q}'+{r.total_results}")
                         if q not in visited:
@@ -657,8 +669,11 @@ def deep_audio_node(state: InvestigationState) -> dict:
                 # 2. 转录全文
                 if full_text:
                     (save_dir / "transcript.txt").write_text(full_text, encoding="utf-8")
-                # 3. 元信息（bvid/标题/来源调查）
+                # 3. 元信息（bvid/标题/来源调查/来源搜索词）
                 import json as _json
+                # 追踪这个视频来自哪次搜索（search_node 注入 metadata.search_query）
+                search_query = (v.metadata or {}).get("search_query", "")
+                search_round = (v.metadata or {}).get("search_round", "")
                 meta = {
                     "bvid": bvid,
                     "title": v.title,
@@ -667,6 +682,14 @@ def deep_audio_node(state: InvestigationState) -> dict:
                     "asr_chars": len(full_text),
                     "audio_files": copied,
                     "saved_at": time.time(),
+                    # 来源追踪（哪个调查/哪轮/哪个搜索词搜出来的）
+                    "investigation": {
+                        "job_id": state.get("job_id", ""),
+                        "entity": state.get("entity_name", ""),
+                        "round": state.get("round", 1),
+                    },
+                    "search_query": search_query,
+                    "search_round": search_round,
                 }
                 (save_dir / "meta.json").write_text(
                     _json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"

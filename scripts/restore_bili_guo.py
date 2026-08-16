@@ -57,6 +57,8 @@ def main():
             (save_dir / "transcript.txt").write_text(full_text, encoding="utf-8")
 
         # 3. meta.json
+        search_query = (r.metadata or {}).get("search_query", "")
+        search_round = (r.metadata or {}).get("search_round", "")
         meta = {
             "bvid": bvid,
             "title": r.title,
@@ -66,6 +68,13 @@ def main():
             "audio_files": copied,
             "saved_at": time.time(),
             "restored_from": "checkpoint+tmp",
+            "investigation": {
+                "job_id": "e7bef336e073",
+                "entity": "郭德纲",
+                "round": None,
+            },
+            "search_query": search_query,
+            "search_round": search_round,
         }
         (save_dir / "meta.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
