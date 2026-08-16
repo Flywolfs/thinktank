@@ -450,18 +450,27 @@ def _plan_fix_and_output(llm, entity: str, hints: str, goal: str,
 def _merge_reports(target: EntityReport, new: EntityReport):
     """把一次搜索的结果合并进累积 report（按 URL 去重）"""
     seen = {r.url for r in target.web_results + target.social_results + target.knowledge_results}
+    added = 0
     for r in new.web_results:
         if r.url not in seen:
             target.web_results.append(r)
             seen.add(r.url)
+            added += 1
     for r in new.social_results:
         if r.url not in seen:
             target.social_results.append(r)
             seen.add(r.url)
+            added += 1
     for r in new.knowledge_results:
         if r.url not in seen:
             target.knowledge_results.append(r)
             seen.add(r.url)
+            added += 1
+    # 修复: 同步更新 total_results（之前从不更新 → 下游认为无数据）
+    target.total_results = (
+        len(target.web_results) + len(target.social_results) + len(target.knowledge_results)
+    )
+    return added
 
 
 # ── 节点实现 ──────────────────────────────────────────
