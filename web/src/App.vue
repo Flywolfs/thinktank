@@ -271,7 +271,7 @@
             </template>
             <div ref="graphEl" class="graph-canvas"></div>
             <div v-if="!graphEntities.length" class="empty-hint">
-              输入实体名查询知识图谱（Neo4j），可调跳数展开；点击节点可继续深挖
+              输入实体名查询知识图谱（Neo4j），可调跳数；单击节点展开/收起跨图谱连接，双击深挖
             </div>
 
             <!-- P4.2 深挖面板 -->
@@ -327,6 +327,10 @@ const graphEl = ref(null)
 const graphDepth = ref(1)
 const logs = ref([])
 const logLevel = ref('')
+// 跨图谱展开状态（P4.2 增强）
+const graphBase = ref([])            // 初始查询实体
+const expandedGraph = ref({})        // {nodeName: [entities]} — 各节点展开拉进来的实体
+let clickTimer = null                // 区分单击/双击
 // P4.2 深挖
 const deepDiveTarget = ref('')
 const deepDiveHints = ref('')
@@ -624,11 +628,39 @@ async function queryGraph(name) {
   try {
     const { data } = await axios.get(`/api/graph/subgraph/${encodeURIComponent(q.trim())}`,
       { params: { depth: graphDepth.value } })
-    graphEntities.value = data.entities || []
-    renderGraph(data.entities || [], q.trim())
+    // 重置: 基础视图 = 新查询, 清空所有展开
+    graphBase.value = data.entities || []
+    expandedGraph.value = {}
+    renderMergedGraph(q.trim())
   } catch (e) {
     ElMessage.error('图谱查询失败')
   }
+}
+
+// 跨图谱合并渲染: 基础 + 所有展开节点 → 按 name 去重实体、去重边
+function renderMergedGraph(centerName) {
+  const all = [...graphBase.value]
+  for (const ents of Object.values(expandedGraph.value)) {
+    all.push(...ents)
+  }
+  // 实体去重（按 name，关系合并）
+  const entityMap = new Map()
+  for (const e of all) {
+    if (!e.name) continue
+    if (!entityMap.has(e.name)) {
+      entityMap.set(e.name, { ...e, relations: [...(e.relations || [])] })
+    } else {
+      const existing = entityMap.get(e.name)
+      for (const rel of e.relations || []) {
+        const relKey = `${rel.type || ''}|${rel.rel || ''}|${rel.other || rel.target || ''}`
+        if (!existing.relations.some(r => `${r.type || ''}|${r.rel || ''}|${r.other || r.target || ''}` === relKey)) {
+          existing.relations.push(rel)
+        }
+      }
+    }
+  }
+  graphEntities.value = [...entityMap.values()]
+  renderGraph(graphEntities.value, centerName)
 }
 
 function renderGraph(entities, centerName) {
@@ -637,12 +669,19 @@ function renderGraph(entities, centerName) {
   }
   if (!graphChart) return
 
-  const nodes = entities.map(e => ({
-    id: e.name,
-    name: e.name,
-    category: e.type || 'entity',
-    symbolSize: e.name === centerName ? 40 : 30,
-  }))
+  // 已展开的节点用不同颜色/大小标记（可收起）
+  const expandedSet = new Set(Object.keys(expandedGraph.value))
+
+  const nodes = entities.map(e => {
+    const isExpanded = expandedSet.has(e.name)
+    return {
+      id: e.name,
+      name: e.name,
+      category: e.type || 'entity',
+      symbolSize: e.name === centerName ? 44 : (isExpanded ? 36 : 28),
+      itemStyle: isExpanded ? { borderColor: '#e6a23c', borderWidth: 3 } : {},
+    }
+  })
   const links = []
   for (const e of entities) {
     for (const rel of e.relations || []) {
@@ -666,23 +705,51 @@ function renderGraph(entities, centerName) {
       categories: [...new Set(nodes.map(n => n.category))].map(c => ({ name: c })),
       label: { show: true, fontSize: 10 },
       force: { repulsion: 200, edgeLength: 80 },
-      // P4.1: 点击节点展开该实体子图
       emphasis: { focus: 'adjacency' },
     }],
   })
-  // P4.1/4.2: 单击节点 → 深挖面板（查实体状态）；双击 → 展开子图
+  // 单击 = 跨图谱展开/收起；双击 = 深挖面板
   graphChart.off('click')
   graphChart.off('dblclick')
   graphChart.on('click', params => {
+    if (params.dataType !== 'node') return
+    // 延迟 250ms 区分双击
+    if (clickTimer) clearTimeout(clickTimer)
+    clickTimer = setTimeout(() => toggleExpand(params.data.name), 250)
+  })
+  graphChart.on('dblclick', params => {
+    if (clickTimer) { clearTimeout(clickTimer); clickTimer = null }
     if (params.dataType === 'node') {
       openDeepDive(params.data.name)
     }
   })
-  graphChart.on('dblclick', params => {
-    if (params.dataType === 'node' && params.data.name !== centerName) {
-      queryGraph(params.data.name)
+}
+
+// 单击节点: 展开（拉入该节点跨图谱连接）/ 收起（移除该节点展开的内容）
+async function toggleExpand(name) {
+  if (!name) return
+  // 已展开 → 收起
+  if (expandedGraph.value[name]) {
+    const newExpanded = { ...expandedGraph.value }
+    delete newExpanded[name]
+    expandedGraph.value = newExpanded
+    ElMessage.info(`已收起「${name}」`)
+    renderMergedGraph(graphQuery.value.trim())
+    return
+  }
+  // 未展开 → 查询该节点子图（跨图谱，depth=1），合并显示
+  try {
+    const { data } = await axios.get(`/api/graph/subgraph/${encodeURIComponent(name)}`,
+      { params: { depth: 1 } })
+    if (!data.entities || data.entities.length === 0) {
+      ElMessage.warning(`「${name}」没有更多连接`)
+      return
     }
-  })
+    expandedGraph.value = { ...expandedGraph.value, [name]: data.entities }
+    renderMergedGraph(graphQuery.value.trim())
+  } catch (e) {
+    ElMessage.error('展开失败: ' + (e.response?.data?.detail || e.message))
+  }
 }
 
 // ── P4.2 深挖 ─────────────────────────────────────────
